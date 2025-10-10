@@ -14,10 +14,12 @@ use base32::{Alphabet, decode};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
-use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use rpassword::read_password;
 use sha2::{Digest, Sha256};
+
+use argon2::{Argon2, Params, Version, Algorithm};
+
 type HmacSha1 = Hmac<sha1::Sha1>;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -26,12 +28,35 @@ struct StoredData {
     salt: Vec<u8>,
 }
 
-const PBKDF2_ROUNDS: u32 = 250_000;
+
+const ARGON2_TIME: u32 = 3;       
+const ARGON2_MEMORY: u32 = 131072;
+const ARGON2_PARALLELISM: u32 = 4; 
+
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
+    let params = Params::new(
+        ARGON2_MEMORY,
+        ARGON2_TIME,
+        ARGON2_PARALLELISM,
+        Some(32),
+    ).expect("Argon2 parameters could not be created (This should not happen)");
+
+    let argon2 = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        params,
+    );
+
     let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, PBKDF2_ROUNDS, &mut key);
+
+    argon2.hash_password_into(
+        password.as_bytes(),
+        salt,
+        &mut key
+    ).expect("Argon2 key derivation failed (Critical error)");
+
     GenericArray::clone_from_slice(&key)
 }
 
@@ -335,9 +360,9 @@ fn main() -> io::Result<()> {
     println!(r" \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|");
     println!("--------------------------------------------------");
     println!(" Attention:");
-    println!(" This application encrypts your data locally.");
+    println!(" This application encrypts your data locally using Argon2id.");
     println!(" If you forget your master password, you will not be able to recover your saved accounts.");
-    println!(" Use the backup feature to store your data safely.");
+    println!(" Use the backup feature to store your data securely.");
     println!("--------------------------------------------------");
     println!("Press Enter to continue...");
     io::stdout().flush()?;
