@@ -16,6 +16,7 @@ use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use rpassword::read_password;
 use sha2::{Digest, Sha256};
 type HmacSha1 = Hmac<sha1::Sha1>;
