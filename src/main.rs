@@ -325,7 +325,14 @@ fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    println!("Kripton Authenticator");
+    println!(r" $$\   $$\                  $$$$$$\              $$\     $$\       ");
+    println!(r" $$ | $$  |                $$  __$$\             $$ |    $$ |      ");
+    println!(r" $$ |$$  /  $$$$$$\        $$ /  $$ |$$\   $$\ $$$$$$\   $$$$$$$\  ");
+    println!(r" $$$$$  /  $$  __$$\       $$$$$$$$ |$$ |  $$ |\_$$  _|  $$  __$$\ ");
+    println!(r" $$  $$<   $$ |  \__|      $$  __$$ |$$ |  $$ |  $$ |    $$ |  $$ |");
+    println!(r" $$ |\$$\  $$ |            $$ |  $$ |$$ |  $$ |  $$ |$$\ $$ |  $$ |");
+    println!(r" $$ | \$$\ $$ |            $$ |  $$ |\$$$$$$  |  \$$$$  |$$ |  $$ |");
+    println!(r" \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|");
     println!("--------------------------------------------------");
     println!(" Attention:");
     println!(" This application encrypts your data locally.");
