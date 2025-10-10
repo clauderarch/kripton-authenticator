@@ -188,7 +188,7 @@ fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
     }
 
     if full_path.exists() {
-        print!("{} zaten mevcut, üzerine yazılsın mı? (Y/N): ", full_path.display());
+        print!("{} already exists, should we write on it? (Y/N): ", full_path.display());
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
