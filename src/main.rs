@@ -16,7 +16,6 @@ use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
 use rpassword::read_password;
 use sha2::{Digest, Sha256};
 type HmacSha1 = Hmac<sha1::Sha1>;
@@ -27,9 +26,7 @@ struct StoredData {
     salt: Vec<u8>,
 }
 
-// PBKDF2 iterasyon sayısını güvenlik için artırmak iyi bir fikirdir.
-// const PBKDF2_ROUNDS: u32 = 100_000;
-const PBKDF2_ROUNDS: u32 = 250_000; // Artırıldı
+const PBKDF2_ROUNDS: u32 = 250_000;
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
@@ -81,11 +78,9 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> io::Result<(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // Hata yönetimi iyileştirildi, unwrap() kaldırıldı
     let plaintext = serde_json::to_vec(data)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Serialization failed: {}", e)))?;
     
-    // Hata yönetimi iyileştirildi, expect() kaldırıldı
     let ciphertext = cipher.encrypt(nonce, plaintext.as_ref())
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
 
@@ -242,7 +237,6 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
         io::stdout().flush()?;
         let pass2 = read_password().expect("Password could not be read");
 
-        // Trimlenmiş şifreler karşılaştırılıyor
         let trimmed_pass1 = pass1.trim();
         let trimmed_pass2 = pass2.trim();
 
@@ -251,7 +245,6 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
             return Ok(());
         }
 
-        // Şifrelemede trimlenmiş şifre kullanılıyor
         match encrypt_data(plaintext.as_bytes(), trimmed_pass1) {
             Ok(encrypted) => {
                 let mut f = File::create(&backup_path)?;
@@ -348,12 +341,10 @@ fn main() -> io::Result<()> {
     let password: String;
 
     if any_store {
-        // Var olan bir store bulundu — parola sor.
         print!("Enter your password: ");
         io::stdout().flush()?;
         password = read_password().expect("The password could not be read.");
     } else {
-        // Hiç store yok — yeni parola belirle.
         print!("Set a new password: ");
         io::stdout().flush()?;
         let first = read_password().expect("The password could not be read.");
@@ -370,7 +361,6 @@ fn main() -> io::Result<()> {
     let path = store_path_for_password(&password);
     let mut store;
 
-    // Kritik Hata Düzeltmesi ve Çoklu Profil Desteği Mantığı
     if path.exists() {
         match decrypt_store(&path, &password) {
             Ok(data) => {
@@ -378,14 +368,12 @@ fn main() -> io::Result<()> {
                 store = data;
             },
             Err(e) => {
-                // Şifre yanlışsa veya dosya bozuksa programdan çık. Veri kaybı riski önlenir.
                 eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.file_name().unwrap_or_default().to_string_lossy());
                 eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
                 return Err(e);
             }
         }
     } else {
-        // Yeni profil oluşturma mantığı
         println!("\nNo existing store found for this password. A new, encrypted file will be created upon saving the first account.");
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
