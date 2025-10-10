@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Version=0.5
+Version=0.6.0
 Name=Kripton Authenticator
 Comment=Two-factor authentication CLI tool
 Exec=kripton-authenticator
