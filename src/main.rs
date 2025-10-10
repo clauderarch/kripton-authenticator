@@ -16,9 +16,9 @@ use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
+use sha1::Sha1;
 use rpassword::read_password;
-
+use sha2::{Digest, Sha256};
 type HmacSha1 = Hmac<sha1::Sha1>;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,16 +27,18 @@ struct StoredData {
     salt: Vec<u8>,
 }
 
-const PBKDF2_ROUNDS: u32 = 100_000;
+// PBKDF2 iterasyon sayısını güvenlik için artırmak iyi bir fikirdir.
+// const PBKDF2_ROUNDS: u32 = 100_000;
+const PBKDF2_ROUNDS: u32 = 250_000; // Artırıldı
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
     let mut key = [0u8; 32];
-    pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), salt, PBKDF2_ROUNDS, &mut key);
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, PBKDF2_ROUNDS, &mut key);
     GenericArray::clone_from_slice(&key)
 }
 
-fn encrypt_data(data: &[u8], password: &str) -> Vec<u8> {
+fn encrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
 
@@ -47,13 +49,14 @@ fn encrypt_data(data: &[u8], password: &str) -> Vec<u8> {
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, data).expect("encryption failed");
+    let ciphertext = cipher.encrypt(nonce, data)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
 
     let mut result = Vec::new();
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&salt);
     result.extend_from_slice(&ciphertext);
-    result
+    Ok(result)
 }
 
 fn decrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
@@ -78,8 +81,13 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> io::Result<(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let plaintext = serde_json::to_vec(data).unwrap();
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).expect("encryption failed");
+    // Hata yönetimi iyileştirildi, unwrap() kaldırıldı
+    let plaintext = serde_json::to_vec(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Serialization failed: {}", e)))?;
+    
+    // Hata yönetimi iyileştirildi, expect() kaldırıldı
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_ref())
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
 
     let mut file_data = Vec::new();
     file_data.extend_from_slice(&nonce_bytes);
@@ -137,7 +145,7 @@ fn generate_totp(secret_b32: &str) -> Option<String> {
 }
 
 fn store_path_for_password(password: &str) -> PathBuf {
-    let mut hasher = Sha1::new();
+    let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
     let hexdigest = format!("{:x}", result);
@@ -233,15 +241,28 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
         print!("Entry password again: ");
         io::stdout().flush()?;
         let pass2 = read_password().expect("Password could not be read");
-        if pass1 != pass2 {
+
+        // Trimlenmiş şifreler karşılaştırılıyor
+        let trimmed_pass1 = pass1.trim();
+        let trimmed_pass2 = pass2.trim();
+
+        if trimmed_pass1 != trimmed_pass2 {
             println!("Passwords do not match, transaction canceled.");
             return Ok(());
         }
-        let encrypted = encrypt_data(plaintext.as_bytes(), pass1.trim());
-        let mut f = File::create(&backup_path)?;
-        f.write_all(&encrypted)?;
-        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
-        println!("Encrypted back up completed: {}", backup_path.display());
+
+        // Şifrelemede trimlenmiş şifre kullanılıyor
+        match encrypt_data(plaintext.as_bytes(), trimmed_pass1) {
+            Ok(encrypted) => {
+                let mut f = File::create(&backup_path)?;
+                f.write_all(&encrypted)?;
+                fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
+                println!("Encrypted back up completed: {}", backup_path.display());
+            },
+            Err(e) => {
+                println!("Backup encryption failed: {}", e);
+            }
+        }
     } else {
         let mut f = File::create(&backup_path)?;
         f.write_all(plaintext.as_bytes())?;
@@ -347,17 +368,28 @@ fn main() -> io::Result<()> {
     }
 
     let path = store_path_for_password(&password);
+    let mut store;
 
-    let mut store = if path.exists() {
-        decrypt_store(&path, &password).unwrap_or_else(|_| {
-            println!("File could not be decrypted or password incorrect. A new file will be created.");
-            StoredData { entries: HashMap::new(), salt: vec![0u8; 16] }
-        })
+    // Kritik Hata Düzeltmesi ve Çoklu Profil Desteği Mantığı
+    if path.exists() {
+        match decrypt_store(&path, &password) {
+            Ok(data) => {
+                println!("\nStore loaded successfully: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                store = data;
+            },
+            Err(e) => {
+                // Şifre yanlışsa veya dosya bozuksa programdan çık. Veri kaybı riski önlenir.
+                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.file_name().unwrap_or_default().to_string_lossy());
+                eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
+                return Err(e);
+            }
+        }
     } else {
-        println!("This password does not exist, a new encrypted file will be created.");
+        // Yeni profil oluşturma mantığı
+        println!("\nNo existing store found for this password. A new, encrypted file will be created upon saving the first account.");
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
-        StoredData { entries: HashMap::new(), salt: salt.to_vec() }
+        store = StoredData { entries: HashMap::new(), salt: salt.to_vec() };
     };
 
     loop {
@@ -458,4 +490,3 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
-
