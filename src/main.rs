@@ -56,7 +56,6 @@ impl From<argon2::Error> for AppError {
 }
 
 type AppResult<T> = Result<T, AppError>;
-
 type HmacSha1 = Hmac<sha1::Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -89,11 +88,9 @@ struct StoredData {
     entries: HashMap<String, OtpEntry>,
     salt: Vec<u8>,
 }
-
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
 const ARGON2_PARALLELISM: u32 = 4; 
-
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn get_project_dirs() -> AppResult<PathBuf> {
@@ -148,7 +145,6 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum
         Some(32),
     )
     .map_err(|e| AppError::Argon2Params(e.to_string()))?;
-
     let argon2 = Argon2::new(
         ArgonAlgorithm::Argon2id,
         Version::V0x13,
@@ -156,7 +152,6 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum
     );
 
     let mut key = Zeroizing::new([0u8; 32]);
-
     argon2.hash_password_into(
         password.as_bytes(),
         salt,
@@ -171,12 +166,10 @@ fn core_encrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, data: &[u8]) ->
     cipher.encrypt(nonce, data)
         .map_err(|_| AppError::Crypto)
 }
-
 fn core_decrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, ciphertext: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
     let cipher = Aes256Gcm::new(key);
     let plaintext = cipher.decrypt(nonce, ciphertext)
         .map_err(|_| AppError::Crypto)?;
-    
     Ok(Zeroizing::new(plaintext))
 }
 
@@ -184,15 +177,11 @@ fn core_decrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, ciphertext: &[u
 fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-
     let key = derive_key(password, &salt)?;
-
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-
     let ciphertext = core_encrypt(&key, nonce, data)?; 
-
     let mut result = Vec::new();
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&salt);
@@ -206,30 +195,41 @@ fn decrypt_data(data: &[u8], password: &str) -> AppResult<Zeroizing<Vec<u8>>> {
     }
     let (nonce_bytes, rest) = data.split_at(12);
     let (salt, ciphertext) = rest.split_at(16);
-
     let key = derive_key(password, salt)?;
     let nonce = Nonce::from_slice(nonce_bytes);
-
     core_decrypt(&key, nonce, ciphertext) 
 }
 
 fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()> {
     let key = derive_key(password, &data.salt)?;
-
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-
     let plaintext = serde_json::to_vec(data)?;
-    
     let ciphertext = core_encrypt(&key, nonce, plaintext.as_ref())?; 
-
     let mut file_data = Vec::new();
     file_data.extend_from_slice(&nonce_bytes);
     file_data.extend_from_slice(&data.salt);
     file_data.extend_from_slice(&ciphertext);
-
     let tmp_path = path.with_extension("tmp");
+    struct TmpFileGuard<'a> {
+        path: &'a Path,
+        should_delete: bool,
+    }
+    
+    impl<'a> Drop for TmpFileGuard<'a> {
+        fn drop(&mut self) {
+            if self.should_delete && self.path.exists() {
+                let _ = fs::remove_file(self.path);
+            }
+        }
+    }
+    
+    let mut guard = TmpFileGuard {
+        path: &tmp_path,
+        should_delete: true,
+    };
+    
     {
         let mut tmp = File::create(&tmp_path)?;
         tmp.write_all(&file_data)?;
@@ -237,6 +237,7 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()
     }
     fs::rename(&tmp_path, path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    guard.should_delete = false;
     println!("Store saved to {}", path.display());
     Ok(())
 }
@@ -245,19 +246,14 @@ fn decrypt_store(path: &Path, password: &str) -> AppResult<StoredData> {
     let mut f = File::open(path)?;
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
-
     if data.len() < 12 + 16 {
         return Err(AppError::InvalidData("File size is too small".to_string()));
     }
-
     let (nonce_bytes, rest) = data.split_at(12);
     let (salt, ciphertext) = rest.split_at(16);
-
     let key = derive_key(password, salt)?;
     let nonce = Nonce::from_slice(nonce_bytes);
-
     let plaintext_zeroizing = core_decrypt(&key, nonce, ciphertext)?; 
-    
     let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)?;
     
     Ok(parsed)
@@ -269,7 +265,6 @@ fn validate_base32(secret: &str) -> Result<(), String> {
     }
     
     let cleaned = secret.replace(" ", "").to_uppercase();
-    
     for ch in cleaned.chars() {
         if !matches!(ch, 'A'..='Z' | '2'..='7' | '=') {
             return Err(format!("Invalid character '{}' in base32 secret. Only A-Z, 2-7, and = are allowed.", ch));
@@ -289,11 +284,8 @@ fn get_remaining_seconds(step: u64) -> u64 {
 fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<String> {
     let cleaned = secret_b32.replace(" ", "").to_uppercase();
     let secret_bytes = decode(Alphabet::Rfc4648 { padding: false }, &cleaned)?;
-    
     let secret = Zeroizing::new(secret_bytes);
-    
     let counter_bytes = counter.to_be_bytes();
-
     let result = match algorithm {
         OtpAlgorithm::Sha1 => {
             let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
@@ -351,7 +343,6 @@ fn get_backup_path_interactive(is_encrypted: bool) -> AppResult<PathBuf> {
     io::stdin().read_line(&mut dir_input)?;
     let dir_input = dir_input.trim();
     let dir_path = Path::new(dir_input);
-
     if !dir_path.exists() || !dir_path.is_dir() {
         println!("The specified folder does not exist.");
         return Err(AppError::InvalidData("The folder could not be found".to_string()));
@@ -413,7 +404,6 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
     let choice = choice.trim();
-
     let is_enc = choice == "2";
     let backup_path = match get_backup_path_interactive(is_enc) {
         Ok(p) => p,
@@ -433,10 +423,8 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         print!("Entry password again: ");
         io::stdout().flush()?;
         let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-
         let trimmed_pass1 = pass1.trim();
         let trimmed_pass2 = pass2.trim();
-
         if trimmed_pass1 != trimmed_pass2 {
             println!("Passwords do not match, transaction canceled.");
             return Ok(());
@@ -567,7 +555,6 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
     io::stdin().read_line(&mut path_input)?;
     let path_input = path_input.trim();
     let backup_path = Path::new(path_input);
-
     if !backup_path.exists() {
         println!("The specified file does not exist.");
         return Ok(());
@@ -575,7 +562,6 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
 
     let mut data = Vec::new();
     File::open(backup_path)?.read_to_end(&mut data)?;
-
     let added = if backup_path.extension().and_then(|s| s.to_str()) == Some("enc") {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
@@ -598,7 +584,6 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
         let text = String::from_utf8_lossy(&data);
         import_from_text(&text, store)
     };
-
     println!("{} new account loaded", added);
     Ok(())
 }
@@ -659,7 +644,6 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
             let mut secret = Zeroizing::new(String::new());
             io::stdin().read_line(&mut *secret)?;
             let secret_trimmed = secret.trim().to_string();
-            
             if let Err(e) = validate_base32(&secret_trimmed) {
                 println!("Invalid secret: {}", e);
                 return Ok(());
@@ -784,7 +768,6 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     let mut secret = Zeroizing::new(String::new());
     io::stdin().read_line(&mut *secret)?;
     let secret_trimmed = secret.trim().to_string();
-    
     if let Err(e) = validate_base32(&secret_trimmed) {
         println!("Error: {}", e);
         return Ok(());
@@ -797,7 +780,6 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     io::stdout().flush()?;
     let mut type_choice = String::new();
     io::stdin().read_line(&mut type_choice)?;
-    
     let otp_type = match type_choice.trim() {
         "1" | "" => OtpType::Totp,
         "2" => OtpType::Hotp,
@@ -827,7 +809,6 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     io::stdout().flush()?;
     let mut digits_choice = String::new();
     io::stdin().read_line(&mut digits_choice)?;
-
     let digits = match digits_choice.trim() {
         "1" | "" => 6,
         "2" => 8,
@@ -1059,6 +1040,8 @@ fn main() -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
 
     #[test]
     fn test_validate_base32_valid() {
@@ -1072,7 +1055,6 @@ mod tests {
         assert!(validate_base32("").is_err());
         assert!(validate_base32("123456789").is_err());
     }
-
     #[test]
     fn test_validate_base32_with_spaces() {
         assert!(validate_base32("JBSW Y3DP EHPK 3PXP").is_ok());
@@ -1081,9 +1063,7 @@ mod tests {
     #[test]
     fn test_calculate_totp_sha1() {
         let secret = Zeroizing::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string());
-        
         let result = calculate_otp(&secret, 1, OtpAlgorithm::Sha1, 6);
-        
         assert!(result.is_some());
         let code = result.unwrap();
         assert_eq!(code.len(), 6);
@@ -1094,7 +1074,6 @@ mod tests {
     fn test_calculate_totp_8_digits() {
         let secret = Zeroizing::new("JBSWY3DPEHPK3PXP".to_string());
         let result = calculate_otp(&secret, 1, OtpAlgorithm::Sha1, 8);
-        
         assert!(result.is_some());
         assert_eq!(result.unwrap().len(), 8); 
     }
@@ -1103,13 +1082,9 @@ mod tests {
     fn test_encrypt_decrypt_data() {
         let original_data = b"Hello, this is a secret message!";
         let password = "super_secret_password";
-        
         let encrypted = encrypt_data(original_data, password).unwrap();
-        
         assert_ne!(encrypted.as_slice(), original_data);
-        
         let decrypted = decrypt_data(&encrypted, password).unwrap();
-        
         assert_eq!(&*decrypted, original_data);
     }
 
@@ -1118,9 +1093,7 @@ mod tests {
         let original_data = b"Secret data";
         let password = "correct_password";
         let wrong_password = "wrong_password";
-        
         let encrypted = encrypt_data(original_data, password).unwrap();
-        
         let result = decrypt_data(&encrypted, wrong_password);
         assert!(result.is_err());
     }
@@ -1135,11 +1108,8 @@ mod tests {
             step: 30,
             counter: 0,
         };
-
         let json = serde_json::to_string(&entry).unwrap();
-        
         let deserialized: OtpEntry = serde_json::from_str(&json).unwrap();
-       
         assert_eq!(deserialized.otp_type, OtpType::Totp);
         assert_eq!(deserialized.algorithm, OtpAlgorithm::Sha1);
         assert_eq!(deserialized.digits, 6);
@@ -1167,17 +1137,13 @@ Counter: 5
             entries: HashMap::new(),
             salt: vec![0u8; 16],
         };
-
         let added = import_from_text(backup_text, &mut store);
-        
         assert_eq!(added, 2); 
         assert!(store.entries.contains_key("TestAccount"));
         assert!(store.entries.contains_key("TestAccount2"));
-        
         let entry1 = store.entries.get("TestAccount").unwrap();
         assert_eq!(entry1.otp_type, OtpType::Totp);
         assert_eq!(entry1.digits, 6);
-        
         let entry2 = store.entries.get("TestAccount2").unwrap();
         assert_eq!(entry2.otp_type, OtpType::Hotp);
         assert_eq!(entry2.counter, 5);
@@ -1187,7 +1153,6 @@ Counter: 5
     fn test_calculate_otp_invalid_secret() {
         let invalid_secret = Zeroizing::new("INVALID!!!".to_string());
         let result = calculate_otp(&invalid_secret, 1, OtpAlgorithm::Sha1, 6);
-        
         assert!(result.is_none());
     }
 
@@ -1195,21 +1160,135 @@ Counter: 5
     fn test_remaining_seconds() {
         let step = 30u64;
         let remaining = get_remaining_seconds(step);
-        
         assert!(remaining > 0 && remaining <= step);
     }
 
     #[test]
     fn test_derive_key_performance() {
-        use std::time::Instant;
-        
+        use std::time::Instant;        
         let password = "test_password";
         let salt = [0u8; 16];
-        
         let start = Instant::now();
         let _key = derive_key(password, &salt).unwrap();
         let duration = start.elapsed();
-        
         assert!(duration.as_secs() < 60);
+    }
+    #[test]
+    fn test_encrypt_store_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let store_path = temp_dir.path().join("test_store.enc");
+        let password = "test_password";
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let mut entries = HashMap::new();
+        entries.insert(
+            "TestAccount".to_string(),
+            OtpEntry {
+                secret: Zeroizing::new("JBSWY3DPEHPK3PXP".to_string()),
+                otp_type: OtpType::Totp,
+                algorithm: OtpAlgorithm::Sha1,
+                digits: 6,
+                step: 30,
+                counter: 0,
+            },
+        );
+        
+        let store = StoredData {
+            entries,
+            salt: salt.to_vec(),
+        };
+        encrypt_store(&store_path, password, &store).unwrap();
+        assert!(store_path.exists());
+        let tmp_path = store_path.with_extension("tmp");
+        assert!(!tmp_path.exists(), "Tmp file should be cleaned up after success");
+        let decrypted = decrypt_store(&store_path, password).unwrap();
+        assert_eq!(decrypted.entries.len(), 1);
+        assert!(decrypted.entries.contains_key("TestAccount"));
+    }
+
+    #[test]
+    fn test_encrypt_store_tmp_cleanup_on_rename_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let store_path = temp_dir.path().join("test_store.enc");
+        let password = "test_password";
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let store = StoredData {
+            entries: HashMap::new(),
+            salt: salt.to_vec(),
+        };
+        
+        File::create(&store_path).unwrap();
+        let parent_perms = fs::Permissions::from_mode(0o444);
+        fs::set_permissions(temp_dir.path(), parent_perms).unwrap();
+        let tmp_path = store_path.with_extension("tmp");
+        let result = encrypt_store(&store_path, password, &store);
+        let restore_perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(temp_dir.path(), restore_perms).unwrap();
+        assert!(result.is_err());
+        assert!(!tmp_path.exists(), "Tmp file should be cleaned up after rename error");
+    }
+
+    #[test]
+    fn test_encrypt_store_no_leftover_tmp_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let store_path = temp_dir.path().join("test_store.enc");
+        let password = "test_password";
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let store = StoredData {
+            entries: HashMap::new(),
+            salt: salt.to_vec(),
+        };
+        for _ in 0..5 {
+            encrypt_store(&store_path, password, &store).unwrap();
+        }
+        let file_count = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .count();      
+        assert_eq!(file_count, 1, "Should only have the main .enc file, no .tmp leftovers");      
+        let tmp_path = store_path.with_extension("tmp");
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn test_encrypt_store_concurrent_tmp_cleanup() {
+        use std::sync::Arc;
+        use std::thread;     
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = Arc::new(temp_dir.path().to_path_buf());  
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let path = Arc::clone(&temp_path);
+                thread::spawn(move || {
+                    let store_path = path.join(format!("store_{}.enc", i));
+                    let password = format!("password_{}", i);                   
+                    let mut salt = [0u8; 16];
+                    OsRng.fill_bytes(&mut salt);                 
+                    let store = StoredData {
+                        entries: HashMap::new(),
+                        salt: salt.to_vec(),
+                    };                   
+                    encrypt_store(&store_path, &password, &store).unwrap();
+                    
+                    let tmp_path = store_path.with_extension("tmp");
+                    assert!(!tmp_path.exists());
+                })
+            })
+            .collect();        
+        for handle in handles {
+            handle.join().unwrap();
+        }       
+        let files: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();       
+        assert_eq!(files.len(), 3);
+        for entry in files {
+            let path = entry.path();
+            assert_eq!(path.extension().and_then(|s| s.to_str()), Some("enc"));
+        }
     }
 }
