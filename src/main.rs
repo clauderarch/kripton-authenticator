@@ -16,18 +16,50 @@ use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
 use serde::{Deserialize, Serialize};
 use rpassword::read_password;
-use sha2::{Digest, Sha256};
-use argon2::{Argon2, Params, Version, Algorithm};
+use sha2::{Digest, Sha256, Sha512};
+use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
 
 type HmacSha1 = Hmac<sha1::Sha1>;
+type HmacSha256 = Hmac<Sha256>;
+type HmacSha512 = Hmac<Sha512>;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+enum OtpType {
+    Totp,
+    Hotp,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+enum OtpAlgorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct OtpEntry {
+    secret: Zeroizing<String>,
+    otp_type: OtpType,
+    algorithm: OtpAlgorithm,
+    digits: u8,
+    step: u64,
+    counter: u64,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct StoredData {
+    entries: HashMap<String, OtpEntry>,
+    salt: Vec<u8>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OldStoredData {
     entries: HashMap<String, String>,
     salt: Vec<u8>,
 }
+
 
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
@@ -88,7 +120,7 @@ fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
     ).expect("Argon2 parameters could not be created (This should not happen)");
 
     let argon2 = Argon2::new(
-        Algorithm::Argon2id,
+        ArgonAlgorithm::Argon2id,
         Version::V0x13,
         params,
     );
@@ -169,6 +201,7 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> io::Result<(
     }
     fs::rename(&tmp_path, path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    println!("Store saved to {}", path.display());
     Ok(())
 }
 
@@ -192,10 +225,43 @@ fn decrypt_store(path: &Path, password: &str) -> io::Result<StoredData> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
     
     let plaintext_zeroizing = Zeroizing::new(plaintext);
-    let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "json decode failed"))?;
     
-    Ok(parsed)
+    match serde_json::from_slice::<StoredData>(&*plaintext_zeroizing) {
+        Ok(parsed) => {
+            println!("INFO: Store successfully loaded using NEW structure.");
+            Ok(parsed)
+        }
+        Err(new_struct_err) => {
+            eprintln!("WARNING: Failed to parse with new structure. Trying old structure...");
+
+            match serde_json::from_slice::<OldStoredData>(&*plaintext_zeroizing) {
+                Ok(old_data) => {
+                    println!("INFO: Store successfully loaded using OLD structure. Migrating data to new format...");
+                    
+                    let mut new_entries = HashMap::new();
+                    for (name, secret_b32_string) in old_data.entries {
+                        let entry = OtpEntry {
+                            secret: Zeroizing::new(secret_b32_string),
+                            otp_type: OtpType::Totp,
+                            algorithm: OtpAlgorithm::Sha1,
+                            digits: 6,
+                            step: 30,
+                            counter: 0,
+                        };
+                        new_entries.insert(name, entry);
+                    }
+
+                    Ok(StoredData {
+                        entries: new_entries,
+                        salt: old_data.salt,
+                    })
+                }
+                Err(old_struct_err) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, "json decode failed (File structure mismatch or corruption)"))
+                }
+            }
+        }
+    }
 }
 
 fn validate_base32(secret: &str) -> Result<(), String> {
@@ -211,28 +277,38 @@ fn validate_base32(secret: &str) -> Result<(), String> {
         }
     }
     
-    match decode(Alphabet::RFC4648 { padding: false }, &cleaned) {
+    match decode(Alphabet::Rfc4648 { padding: false }, &cleaned) {
         Some(_) => Ok(()),
         None => Err("Invalid base32 format. Please check your secret.".to_string()),
     }
 }
 
-fn get_remaining_seconds() -> u64 {
-    30 - ((Utc::now().timestamp() % 30) as u64)
+fn get_remaining_seconds(step: u64) -> u64 {
+    step - ((Utc::now().timestamp() % step as i64) as u64)
 }
 
-fn generate_totp(secret_b32: &str) -> Option<String> {
+fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<String> {
     let cleaned = secret_b32.replace(" ", "").to_uppercase();
-    let secret_bytes = decode(Alphabet::RFC4648 { padding: false }, &cleaned)?;
-    
+    let secret_bytes = decode(Alphabet::Rfc4648 { padding: false }, &cleaned)?;
     let secret = Zeroizing::new(secret_bytes);
-    
-    let timestep = (Utc::now().timestamp() / 30) as u64;
-    let counter = timestep.to_be_bytes();
-
-    let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
-    mac.update(&counter);
-    let result = mac.finalize().into_bytes();
+    let counter_bytes = counter.to_be_bytes();
+    let result = match algorithm {
+        OtpAlgorithm::Sha1 => {
+            let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
+            mac.update(&counter_bytes);
+            mac.finalize().into_bytes().to_vec()
+        }
+        OtpAlgorithm::Sha256 => {
+            let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
+            mac.update(&counter_bytes);
+            mac.finalize().into_bytes().to_vec()
+        }
+        OtpAlgorithm::Sha512 => {
+            let mut mac = <HmacSha512 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
+            mac.update(&counter_bytes);
+            mac.finalize().into_bytes().to_vec()
+        }
+    };
 
     let offset = (result[result.len() - 1] & 0x0f) as usize;
     let code = ((u32::from(result[offset]) & 0x7f) << 24)
@@ -240,8 +316,30 @@ fn generate_totp(secret_b32: &str) -> Option<String> {
         | ((u32::from(result[offset + 2]) & 0xff) << 8)
         | (u32::from(result[offset + 3]) & 0xff);
 
-    Some(format!("{:06}", code % 1_000_000))
+    let divisor = match digits {
+        6 => 1_000_000,
+        8 => 100_000_000,
+        _ => return None,
+    };
+
+    Some(format!("{:0width$}", code % divisor, width = digits as usize))
 }
+
+fn generate_otp(entry: &OtpEntry) -> Option<(String, u64)> {
+    match entry.otp_type {
+        OtpType::Totp => {
+            let timestep = (Utc::now().timestamp() / entry.step as i64) as u64;
+            let code = calculate_otp(&entry.secret, timestep, entry.algorithm, entry.digits)?;
+            let remaining = get_remaining_seconds(entry.step);
+            Some((code, remaining))
+        }
+        OtpType::Hotp => {
+            let code = calculate_otp(&entry.secret, entry.counter, entry.algorithm, entry.digits)?;
+            Some((code, 0))
+        }
+    }
+}
+
 
 fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
     print!("Enter the full path of the folder where the backup will be saved. Example:(/home/user/Desktop): ");
@@ -287,6 +385,18 @@ fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
     Ok(full_path)
 }
 
+fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> String {
+    let mut s = format!("Account: {}\nSecret: {}\nType: {:?}\nAlgorithm: {:?}\nDigits: {}\n", 
+                        name, entry.secret.as_str(), entry.otp_type, entry.algorithm, entry.digits);
+    match entry.otp_type {
+        OtpType::Totp => s.push_str(&format!("Step: {}\n", entry.step)),
+        OtpType::Hotp => s.push_str(&format!("Counter: {}\n", entry.counter)),
+    }
+    s.push('\n');
+    s
+}
+
+
 fn backup_codes(store: &StoredData) -> io::Result<()> {
     if store.entries.is_empty() {
         println!("No accounts have been registered yet.");
@@ -308,8 +418,8 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
     };
 
     let mut plaintext = Zeroizing::new(String::new());
-    for (name, secret) in &store.entries {
-        plaintext.push_str(&format!("Account: {}\nSecret: {}\n\n", name, secret));
+    for (name, entry) in &store.entries {
+        plaintext.push_str(&otp_entry_to_string(name, entry));
     }
 
     if is_enc {
@@ -341,7 +451,7 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
         }
     } else {
         println!("\n!!! SECURITY WARNING !!!");
-        println!("Please note that this file is unecrypted. Anyone with access to the file can read it. Please be aware of this risk.");
+        println!("Please note that this file is unencrypted. Anyone with access to the file can read it. Please be aware of this risk.");
         print!("To continue, type ‘YES’ in capital letters: ");
         io::stdout().flush()?;
         let mut confirmation = String::new();
@@ -359,21 +469,87 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
 
     Ok(())
 }
+
 fn import_from_text(text: &str, store: &mut StoredData) -> usize {
     let mut added = 0;
+    
     for block in text.split("\n\n") {
-        let mut lines = block.lines();
-        if let (Some(name_line), Some(secret_line)) = (lines.next(), lines.next()) {
-            if name_line.starts_with("Account:") && secret_line.starts_with("Secret:") {
-                let name = name_line["Account:".len()..].trim();
-                let secret = secret_line["Secret:".len()..].trim();
-                if !store.entries.contains_key(name) {
-                    store.entries.insert(name.to_string(), secret.to_string());
-                    added += 1;
+        let lines: HashMap<&str, &str> = block.lines()
+            .filter_map(|line| {
+                if let Some(index) = line.find(':') {
+                    let (key, value) = line.split_at(index);
+                    Some((key.trim(), value[1..].trim()))
                 } else {
-                    println!("'{}' already exists, so it is skipped.", name);
+                    None
                 }
+            })
+            .collect();
+
+        if lines.is_empty() {
+            continue;
+        }
+
+        let (Some(name), Some(secret), Some(otp_type_str), Some(algo_str), Some(digits_str)) = 
+            (lines.get("Account"), lines.get("Secret"), lines.get("Type"), lines.get("Algorithm"), lines.get("Digits")) 
+        else {
+            println!("Skipping incomplete block in backup.");
+            continue;
+        };
+        
+        let digits: u8 = match digits_str.parse() {
+            Ok(d) if d == 6 || d == 8 => d,
+            _ => { println!("Skipping block with invalid Digits: {}", digits_str); continue; }
+        };
+        
+        let otp_type = match otp_type_str.to_lowercase().as_str() {
+            "totp" => OtpType::Totp,
+            "hotp" => OtpType::Hotp,
+            _ => { println!("Skipping block with invalid Type: {}", otp_type_str); continue; }
+        };
+        
+        let algorithm = match algo_str.to_lowercase().as_str() {
+            "sha1" => OtpAlgorithm::Sha1,
+            "sha256" => OtpAlgorithm::Sha256,
+            "sha512" => OtpAlgorithm::Sha512,
+            _ => { println!("Skipping block with invalid Algorithm: {}", algo_str); continue; }
+        };
+        
+        let mut entry = OtpEntry {
+            secret: Zeroizing::new(secret.to_string()),
+            otp_type,
+            algorithm,
+            digits,
+            step: 30, 
+            counter: 0,
+        };
+
+        match otp_type {
+            OtpType::Totp => {
+                let step: u64 = match lines.get("Step").and_then(|s| s.parse().ok()) {
+                    Some(s) => s,
+                    None => { println!("Skipping TOTP block missing Step."); continue; }
+                };
+                entry.step = step;
             }
+            OtpType::Hotp => {
+                let counter: u64 = match lines.get("Counter").and_then(|s| s.parse().ok()) {
+                    Some(c) => c,
+                    None => { println!("Skipping HOTP block missing Counter."); continue; }
+                };
+                entry.counter = counter;
+            }
+        }
+        
+        if let Err(e) = validate_base32(secret) {
+            println!("Skipping account '{}' due to invalid Base32 secret: {}", name, e);
+            continue;
+        }
+
+        if !store.entries.contains_key(*name) {
+            store.entries.insert(name.to_string(), entry);
+            added += 1;
+        } else {
+            println!("'{}' already exists, so it is skipped.", name);
         }
     }
     added
@@ -431,10 +607,14 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Resu
         return Ok(());
     }
     
-    println!("\nEditing account: {}", name);
+    let entry = store.entries.get(name).unwrap();
+    println!("\nEditing account: {} (Type: {:?}, Algo: {:?}, Digits: {})", 
+             name, entry.otp_type, entry.algorithm, entry.digits);
+    
     println!("1) Rename account");
     println!("2) Update secret");
-    println!("3) Cancel");
+    println!("3) Update parameters (Type/Algo/Digits/Step/Counter)");
+    println!("4) Cancel");
     print!("Choice: ");
     io::stdout().flush()?;
     
@@ -477,11 +657,96 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Resu
                 return Ok(());
             }
             
-            store.entries.insert(name.to_string(), secret_trimmed);
-            encrypt_store(path, password, store)?;
-            println!("Secret updated for '{}'.", name);
+            if let Some(entry) = store.entries.get_mut(name) {
+                entry.secret = Zeroizing::new(secret_trimmed);
+                encrypt_store(path, password, store)?;
+                println!("Secret updated for '{}'.", name);
+            }
         }
         "3" => {
+            let mut new_entry = store.entries.get(name).unwrap().clone();
+            
+            println!("Select OTP Type:");
+            println!("1) TOTP (Time-based, default)");
+            println!("2) HOTP (Counter-based)");
+            print!("Choice (1/2): ");
+            io::stdout().flush()?;
+            let mut type_choice = String::new();
+            io::stdin().read_line(&mut type_choice)?;
+            
+            new_entry.otp_type = match type_choice.trim() {
+                "1" | "" => OtpType::Totp,
+                "2" => OtpType::Hotp,
+                _ => { println!("Invalid choice. Operation cancelled."); return Ok(()); }
+            };
+            
+            println!("Select Algorithm:");
+            println!("1) SHA-1 (default)");
+            println!("2) SHA-256");
+            println!("3) SHA-512");
+            print!("Choice (1/2/3): ");
+            io::stdout().flush()?;
+            let mut algo_choice = String::new();
+            io::stdin().read_line(&mut algo_choice)?;
+
+            new_entry.algorithm = match algo_choice.trim() {
+                "1" | "" => OtpAlgorithm::Sha1,
+                "2" => OtpAlgorithm::Sha256,
+                "3" => OtpAlgorithm::Sha512,
+                _ => { println!("Invalid choice. Operation cancelled."); return Ok(()); }
+            };
+
+            println!("Select Digits:");
+            println!("1) 6 (default)");
+            println!("2) 8");
+            print!("Choice (1/2): ");
+            io::stdout().flush()?;
+            let mut digits_choice = String::new();
+            io::stdin().read_line(&mut digits_choice)?;
+
+            new_entry.digits = match digits_choice.trim() {
+                "1" | "" => 6,
+                "2" => 8,
+                _ => { println!("Invalid choice. Operation cancelled."); return Ok(()); }
+            };
+
+            match new_entry.otp_type {
+                OtpType::Totp => {
+                    print!("Enter Time Step in seconds (e.g., 30, default 30): ");
+                    io::stdout().flush()?;
+                    let mut step_input = String::new();
+                    io::stdin().read_line(&mut step_input)?;
+                    new_entry.step = match step_input.trim() {
+                        "" => 30,
+                        s => match s.parse::<u64>() {
+                            Ok(step) if step > 0 => step,
+                            _ => { println!("Invalid step value. Operation cancelled."); return Ok(()); }
+                        }
+                    };
+                    new_entry.counter = 0;
+                }
+                OtpType::Hotp => {
+                    print!("Enter Initial Counter value (e.g., 0, default 0): ");
+                    io::stdout().flush()?;
+                    let mut counter_input = String::new();
+                    io::stdin().read_line(&mut counter_input)?;
+                    new_entry.counter = match counter_input.trim() {
+                        "" => 0,
+                        s => match s.parse::<u64>() {
+                            Ok(counter) => counter,
+                            _ => { println!("Invalid counter value. Operation cancelled."); return Ok(()); }
+                        }
+                    };
+                    new_entry.step = 0;
+                }
+            }
+
+            *store.entries.get_mut(name).unwrap() = new_entry;
+            encrypt_store(path, password, store)?;
+            println!("Parameters updated for '{}'.", name);
+
+        }
+        "4" => {
             println!("Edit cancelled.");
         }
         _ => println!("Invalid choice."),
@@ -489,6 +754,122 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Resu
     
     Ok(())
 }
+
+
+fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) -> io::Result<()> {
+    print!("Account name: ");
+    io::stdout().flush()?;
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        println!("Invalid name");
+        return Ok(());
+    }
+    if store.entries.contains_key(&name) {
+        println!("An account named '{}' already exists.", name);
+        return Ok(());
+    }
+
+    print!("Secret (base32): ");
+    io::stdout().flush()?;
+    let mut secret = Zeroizing::new(String::new());
+    io::stdin().read_line(&mut *secret)?;
+    let secret_trimmed = secret.trim().to_string();
+    
+    if let Err(e) = validate_base32(&secret_trimmed) {
+        println!("Error: {}", e);
+        return Ok(());
+    }
+
+    println!("\nSelect OTP Type:");
+    println!("1) TOTP (Time-based, default)");
+    println!("2) HOTP (Counter-based)");
+    print!("Choice (1/2): ");
+    io::stdout().flush()?;
+    let mut type_choice = String::new();
+    io::stdin().read_line(&mut type_choice)?;
+    
+    let otp_type = match type_choice.trim() {
+        "1" | "" => OtpType::Totp,
+        "2" => OtpType::Hotp,
+        _ => { println!("Invalid choice. Adding account cancelled."); return Ok(()); }
+    };
+    
+    println!("\nSelect Algorithm:");
+    println!("1) SHA-1 (default)");
+    println!("2) SHA-256");
+    println!("3) SHA-512");
+    print!("Choice (1/2/3): ");
+    io::stdout().flush()?;
+    let mut algo_choice = String::new();
+    io::stdin().read_line(&mut algo_choice)?;
+
+    let algorithm = match algo_choice.trim() {
+        "1" | "" => OtpAlgorithm::Sha1,
+        "2" => OtpAlgorithm::Sha256,
+        "3" => OtpAlgorithm::Sha512,
+        _ => { println!("Invalid choice. Adding account cancelled."); return Ok(()); }
+    };
+
+    println!("\nSelect Digits:");
+    println!("1) 6 (default)");
+    println!("2) 8");
+    print!("Choice (1/2): ");
+    io::stdout().flush()?;
+    let mut digits_choice = String::new();
+    io::stdin().read_line(&mut digits_choice)?;
+
+    let digits = match digits_choice.trim() {
+        "1" | "" => 6,
+        "2" => 8,
+        _ => { println!("Invalid choice. Adding account cancelled."); return Ok(()); }
+    };
+
+    let mut new_entry = OtpEntry {
+        secret: Zeroizing::new(secret_trimmed),
+        otp_type,
+        algorithm,
+        digits,
+        step: 0,
+        counter: 0,
+    };
+
+    match otp_type {
+        OtpType::Totp => {
+            print!("Enter Time Step in seconds (e.g., 30, default 30): ");
+            io::stdout().flush()?;
+            let mut step_input = String::new();
+            io::stdin().read_line(&mut step_input)?;
+            new_entry.step = match step_input.trim() {
+                "" => 30,
+                s => match s.parse::<u64>() {
+                    Ok(step) if step > 0 => step,
+                    _ => { println!("Invalid step value. Adding account cancelled."); return Ok(()); }
+                }
+            };
+        }
+        OtpType::Hotp => {
+            print!("Enter Initial Counter value (e.g., 0, default 0): ");
+            io::stdout().flush()?;
+            let mut counter_input = String::new();
+            io::stdin().read_line(&mut counter_input)?;
+            new_entry.counter = match counter_input.trim() {
+                "" => 0,
+                s => match s.parse::<u64>() {
+                    Ok(counter) => counter,
+                    _ => { println!("Invalid counter value. Adding account cancelled."); return Ok(()); }
+                }
+            };
+        }
+    }
+    
+    store.entries.insert(name.clone(), new_entry);
+    encrypt_store(path, password, store)?;
+    println!("'{}' saved.", name);
+    Ok(())
+}
+
 
 fn main() -> io::Result<()> {
     println!(r" $$\   $$\                  $$$$$$\              $$\     $$\       ");
@@ -541,7 +922,7 @@ fn main() -> io::Result<()> {
                 store = data;
             },
             Err(e) => {
-                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.display());
+                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted. Detail: {}", path.display(), e);
                 eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
                 return Err(e);
             }
@@ -569,33 +950,9 @@ fn main() -> io::Result<()> {
         io::stdin().read_line(&mut choice)?;
         match choice.trim() {
             "1" => {
-                print!("Account name: ");
-                io::stdout().flush()?;
-                let mut name = String::new();
-                io::stdin().read_line(&mut name)?;
-                let name = name.trim().to_string();
-                if name.is_empty() {
-                    println!("Invalid name");
-                    continue;
+                if let Err(e) = add_account_interactive(&mut store, &path, &password) {
+                     println!("Add account error: {}", e);
                 }
-                if store.entries.contains_key(&name) {
-                    println!("An account named '{}' already exists.", name);
-                    continue;
-                }
-                print!("Secret (base32): ");
-                io::stdout().flush()?;
-                let mut secret = Zeroizing::new(String::new());
-                io::stdin().read_line(&mut *secret)?;
-                let secret_trimmed = secret.trim().to_string();
-                
-                if let Err(e) = validate_base32(&secret_trimmed) {
-                    println!("Error: {}", e);
-                    continue;
-                }
-                
-                store.entries.insert(name.clone(), secret_trimmed);
-                encrypt_store(&path, &password, &store)?;
-                println!("'{}' saved.", name);
             }
             "2" => {
                 print!("Account name: ");
@@ -603,13 +960,25 @@ fn main() -> io::Result<()> {
                 let mut name = String::new();
                 io::stdin().read_line(&mut name)?;
                 let name = name.trim();
-                if let Some(secret) = store.entries.get(name) {
-                    if let Some(code) = generate_totp(secret) {
-                        let remaining = get_remaining_seconds();
-                        println!("\nCode: {}", code);
-                        println!("Valid for {} more seconds", remaining);
-                    } else {
-                        println!("Failed to generate code. The secret may be invalid.");
+                if let Some(entry) = store.entries.get(name) {
+                    match generate_otp(entry) {
+                        Some((code, remaining)) => {
+                            println!("\nCode: {}", code);
+                            if entry.otp_type == OtpType::Totp {
+                                println!("Valid for {} more seconds", remaining);
+                            } else {
+                                if let Some(mut_entry) = store.entries.get_mut(name) {
+                                    mut_entry.counter += 1;
+                                    println!("HOTP counter incremented to {}", mut_entry.counter);
+                                    if let Err(e) = encrypt_store(&path, &password, &store) {
+                                        println!("Warning: Could not save updated counter: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            println!("Failed to generate code. Check algorithm or secret.");
+                        }
                     }
                 } else {
                     println!("Account not found.");
@@ -637,11 +1006,13 @@ fn main() -> io::Result<()> {
                 if store.entries.is_empty() {
                     println!("No accounts saved yet.");
                 } else {
-                    println!("\nSaved Accounts:");
+                    println!("\nSaved Accounts (Name | Type | Algorithm | Digits):");
                     let mut sorted_keys: Vec<_> = store.entries.keys().collect();
                     sorted_keys.sort_by_key(|a| a.to_lowercase());
-                    for (i, name) in sorted_keys.iter().enumerate() {
-                        println!("{}. {}", i + 1, name);
+                    for name in sorted_keys.iter() {
+                        let entry = store.entries.get(*name).unwrap();
+                        println!("- {} | {:?} | {:?} | {}", 
+                                 name, entry.otp_type, entry.algorithm, entry.digits);
                     }
                 }
             }
