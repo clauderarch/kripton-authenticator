@@ -19,7 +19,7 @@ You need to have [Rust](https://www.rust-lang.org/tools/install) and [Cargo](htt
 
 ### Arch Linux (AUR)
 
-If a maintainer has created an Arch User Repository (AUR) package, you can install it using an AUR helper like `yay`:
+You can install it using an AUR helper like `yay`:
 
 ```bash
 yay -S kripton-authenticator
