@@ -19,6 +19,7 @@ use rpassword::read_password;
 use sha2::{Digest, Sha256};
 use argon2::{Argon2, Params, Version, Algorithm};
 use directories::ProjectDirs;
+use zeroize::Zeroizing;
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 
@@ -92,15 +93,15 @@ fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
         params,
     );
 
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
 
     argon2.hash_password_into(
         password.as_bytes(),
         salt,
-        &mut key
+        &mut *key
     ).expect("Argon2 key derivation failed (Critical error)");
 
-    GenericArray::clone_from_slice(&key)
+    GenericArray::clone_from_slice(&*key)
 }
 
 fn encrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
@@ -124,7 +125,7 @@ fn encrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
     Ok(result)
 }
 
-fn decrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
+fn decrypt_data(data: &[u8], password: &str) -> io::Result<Zeroizing<Vec<u8>>> {
     if data.len() < 12 + 16 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid file"));
     }
@@ -135,7 +136,10 @@ fn decrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(&key);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    cipher.decrypt(nonce, ciphertext).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
+    
+    Ok(Zeroizing::new(plaintext))
 }
 
 fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> io::Result<()> {
@@ -184,47 +188,49 @@ fn decrypt_store(path: &Path, password: &str) -> io::Result<StoredData> {
     let cipher = Aes256Gcm::new(&key);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
-    let parsed: StoredData = serde_json::from_slice(&plaintext).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "json decode failed"))?;
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
+    
+    let plaintext_zeroizing = Zeroizing::new(plaintext);
+    let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "json decode failed"))?;
+    
     Ok(parsed)
 }
 
-// NEW: Validate base32 secret
 fn validate_base32(secret: &str) -> Result<(), String> {
     if secret.is_empty() {
         return Err("Secret cannot be empty".to_string());
     }
     
-    // Remove spaces and convert to uppercase for validation
     let cleaned = secret.replace(" ", "").to_uppercase();
     
-    // Check if all characters are valid base32
     for ch in cleaned.chars() {
         if !matches!(ch, 'A'..='Z' | '2'..='7' | '=') {
             return Err(format!("Invalid character '{}' in base32 secret. Only A-Z, 2-7, and = are allowed.", ch));
         }
     }
     
-    // Try to decode to verify it's valid
     match decode(Alphabet::RFC4648 { padding: false }, &cleaned) {
         Some(_) => Ok(()),
         None => Err("Invalid base32 format. Please check your secret.".to_string()),
     }
 }
 
-// NEW: Get remaining seconds until next code
 fn get_remaining_seconds() -> u64 {
     30 - ((Utc::now().timestamp() % 30) as u64)
 }
 
 fn generate_totp(secret_b32: &str) -> Option<String> {
-    // Clean the secret (remove spaces, convert to uppercase)
     let cleaned = secret_b32.replace(" ", "").to_uppercase();
-    let secret = decode(Alphabet::RFC4648 { padding: false }, &cleaned)?;
+    let secret_bytes = decode(Alphabet::RFC4648 { padding: false }, &cleaned)?;
+    
+    let secret = Zeroizing::new(secret_bytes);
+    
     let timestep = (Utc::now().timestamp() / 30) as u64;
     let counter = timestep.to_be_bytes();
 
-    let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&secret).ok()?;
+    let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
     mac.update(&counter);
     let result = mac.finalize().into_bytes();
 
@@ -301,18 +307,18 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let mut plaintext = String::new();
+    let mut plaintext = Zeroizing::new(String::new());
     for (name, secret) in &store.entries {
         plaintext.push_str(&format!("Account: {}\nSecret: {}\n\n", name, secret));
     }
 
     if is_enc {
-        print!("Enter the back up password ");
+        print!("Enter the back up password: ");
         io::stdout().flush()?;
-        let pass1 = read_password().expect("Password could not be read");
+        let pass1 = Zeroizing::new(read_password().expect("Password could not be read"));
         print!("Entry password again: ");
         io::stdout().flush()?;
-        let pass2 = read_password().expect("Password could not be read");
+        let pass2 = Zeroizing::new(read_password().expect("Password could not be read"));
 
         let trimmed_pass1 = pass1.trim();
         let trimmed_pass2 = pass2.trim();
@@ -381,11 +387,12 @@ fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
     let added = if backup_path.extension().and_then(|s| s.to_str()) == Some("enc") {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
-        let pass = read_password().expect("The password could not be read.");
+        let pass = Zeroizing::new(read_password().expect("The password could not be read."));
         match decrypt_data(&data, pass.trim()) {
             Ok(plaintext) => {
-                let text = String::from_utf8_lossy(&plaintext);
-                import_from_text(&text, store)
+                let text = String::from_utf8_lossy(&*plaintext);
+                let count = import_from_text(&text, store);
+                count
             }
             Err(_) => {
                 println!("The password is incorrect or the file is corrupted.");
@@ -401,7 +408,6 @@ fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
     Ok(())
 }
 
-// NEW: Edit account function
 fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Result<()> {
     print!("Account name to edit: ");
     io::stdout().flush()?;
@@ -451,17 +457,16 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Resu
         "2" => {
             print!("Enter new secret (base32): ");
             io::stdout().flush()?;
-            let mut secret = String::new();
-            io::stdin().read_line(&mut secret)?;
-            let secret = secret.trim().to_string();
+            let mut secret = Zeroizing::new(String::new());
+            io::stdin().read_line(&mut *secret)?;
+            let secret_trimmed = secret.trim().to_string();
             
-            // Validate the secret
-            if let Err(e) = validate_base32(&secret) {
+            if let Err(e) = validate_base32(&secret_trimmed) {
                 println!("Invalid secret: {}", e);
                 return Ok(());
             }
             
-            store.entries.insert(name.to_string(), secret);
+            store.entries.insert(name.to_string(), secret_trimmed);
             encrypt_store(path, password, store)?;
             println!("Secret updated for '{}'.", name);
         }
@@ -485,7 +490,7 @@ fn main() -> io::Result<()> {
     println!(r" \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|");
     println!("--------------------------------------------------");
     println!(" Attention:");
-    println!(" This application encrypts your data locally using Argon2id.");
+    println!(" This application encrypts your data locally.");
     println!(" If you forget your master password, you will not be able to recover your saved accounts.");
     println!(" Use the backup feature to store your data securely.");
     println!("--------------------------------------------------");
@@ -495,27 +500,26 @@ fn main() -> io::Result<()> {
     io::stdin().read_line(&mut dummy)?;
 
     let any_store = any_store_files_exist()?;
-    let password: String;
+    let password: Zeroizing<String>;
 
     if any_store {
         print!("Enter your password: ");
         io::stdout().flush()?;
-        password = read_password().expect("The password could not be read.");
+        password = Zeroizing::new(read_password().expect("The password could not be read."));
     } else {
         print!("Set a new password: ");
         io::stdout().flush()?;
-        let first = read_password().expect("The password could not be read.");
+        let first = Zeroizing::new(read_password().expect("The password could not be read."));
         print!("Re-enter password: ");
         io::stdout().flush()?;
-        let second = read_password().expect("The password could not be read.");
+        let second = Zeroizing::new(read_password().expect("The password could not be read."));
         if first.trim() != second.trim() {
             println!("Passwords do not match. Exiting.");
             return Ok(());
         }
-        password = first.trim().to_string();
+        password = Zeroizing::new(first.trim().to_string());
     }
     
-
     let path = store_path_for_password(&password)?;
     let mut store;
 
@@ -569,17 +573,16 @@ fn main() -> io::Result<()> {
                 }
                 print!("Secret (base32): ");
                 io::stdout().flush()?;
-                let mut secret = String::new();
-                io::stdin().read_line(&mut secret)?;
-                let secret = secret.trim().to_string();
+                let mut secret = Zeroizing::new(String::new());
+                io::stdin().read_line(&mut *secret)?;
+                let secret_trimmed = secret.trim().to_string();
                 
-                // Validate secret before saving
-                if let Err(e) = validate_base32(&secret) {
+                if let Err(e) = validate_base32(&secret_trimmed) {
                     println!("Error: {}", e);
                     continue;
                 }
                 
-                store.entries.insert(name.clone(), secret);
+                store.entries.insert(name.clone(), secret_trimmed);
                 encrypt_store(&path, &password, &store)?;
                 println!("'{}' saved.", name);
             }

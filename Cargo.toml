@@ -1,6 +1,6 @@
 [package]
 name = "kripton-authenticator"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [dependencies]
@@ -8,7 +8,6 @@ aes-gcm = "0.10"
 base32 = "0.4"
 chrono = "0.4"
 hmac = "0.12"
-pbkdf2 = "0.12"
 sha1 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -18,3 +17,4 @@ rpassword = "7.0"
 sha2 = "0.10"
 argon2 = "0.5"
 directories = "5.0"
+zeroize = { version = "1.7", features = ["alloc"]}
