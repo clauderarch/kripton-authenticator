@@ -20,6 +20,41 @@ use sha2::{Digest, Sha256, Sha512};
 use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
+use thiserror::Error; 
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Argon2 parameter error: {0}")]
+    Argon2Params(String),
+    #[error("Argon2 encryption error: {0}")]
+    Argon2Hash(String), 
+    #[error("Argon2 error: {0}")]
+    Argon2(String),
+    #[error("AES encryption/decryption error")]
+    Crypto,
+    #[error("Data serialization/deserialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("Invalid data format: {0}")]
+    InvalidData(String),
+    #[error("The transaction was canceled by the user: {0}")]
+    Cancelled(String),
+}
+
+impl From<argon2::password_hash::Error> for AppError {
+    fn from(err: argon2::password_hash::Error) -> Self {
+        AppError::Argon2Hash(err.to_string())
+    }
+}
+
+impl From<argon2::Error> for AppError {
+    fn from(err: argon2::Error) -> Self {
+        AppError::Argon2(err.to_string())
+    }
+}
+
+type AppResult<T> = Result<T, AppError>;
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 type HmacSha256 = Hmac<Sha256>;
@@ -60,19 +95,18 @@ const ARGON2_PARALLELISM: u32 = 4;
 
 const STORE_FILE_BASE: &str = "auth_store";
 
-fn get_project_dirs() -> io::Result<PathBuf> {
+fn get_project_dirs() -> AppResult<PathBuf> {
     if let Some(proj_dirs) = ProjectDirs::from("com", "YourOrg", "KriptonAuthenticator") {
         let data_dir = proj_dirs.data_dir();
-        fs::create_dir_all(data_dir)?;
+        fs::create_dir_all(data_dir)?; 
         Ok(data_dir.to_path_buf())
     } else {
-        Err(io::Error::new(io::ErrorKind::NotFound, "Could not find a valid home directory."))
+        Err(AppError::Io(io::Error::new(io::ErrorKind::NotFound, "Could not find a valid home directory.")))
     }
 }
 
-fn store_path_for_password(password: &str) -> io::Result<PathBuf> {
+fn store_path_for_password(password: &str) -> AppResult<PathBuf> {
     let data_dir = get_project_dirs()?;
-
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
@@ -83,17 +117,18 @@ fn store_path_for_password(password: &str) -> io::Result<PathBuf> {
     Ok(data_dir.join(file_name))
 }
 
-fn any_store_files_exist() -> io::Result<bool> {
+fn any_store_files_exist() -> AppResult<bool> {
     let data_dir = match get_project_dirs() {
         Ok(dir) => dir,
-        Err(_) => return Ok(false), 
+        Err(AppError::Io(ref e)) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
 
     if !data_dir.exists() {
         return Ok(false);
     }
 
-    for entry in fs::read_dir(data_dir)? {
+    for entry in fs::read_dir(data_dir)? { 
         let entry = entry?;
         if let Some(name) = entry.file_name().to_str() {
             if name.starts_with(&format!("{}_", STORE_FILE_BASE)) && name.ends_with(".enc") {
@@ -104,13 +139,14 @@ fn any_store_files_exist() -> io::Result<bool> {
     Ok(false)
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
+fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum::U32>> {
     let params = Params::new(
         ARGON2_MEMORY,
         ARGON2_TIME,
         ARGON2_PARALLELISM,
         Some(32),
-    ).expect("Argon2 parameters could not be created (This should not happen)");
+    )
+    .map_err(|e| AppError::Argon2Params(e.to_string()))?;
 
     let argon2 = Argon2::new(
         ArgonAlgorithm::Argon2id,
@@ -124,16 +160,16 @@ fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
         password.as_bytes(),
         salt,
         &mut *key
-    ).expect("Argon2 key derivation failed (Critical error)");
+    )?;
 
-    GenericArray::clone_from_slice(&*key)
+    Ok(GenericArray::clone_from_slice(&*key))
 }
 
-fn encrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
+fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
 
-    let key = derive_key(password, &salt);
+    let key = derive_key(password, &salt)?;
     let cipher = Aes256Gcm::new(&key);
 
     let mut nonce_bytes = [0u8; 12];
@@ -141,7 +177,7 @@ fn encrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher.encrypt(nonce, data)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
+        .map_err(|_| AppError::Crypto)?;
 
     let mut result = Vec::new();
     result.extend_from_slice(&nonce_bytes);
@@ -150,36 +186,35 @@ fn encrypt_data(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
     Ok(result)
 }
 
-fn decrypt_data(data: &[u8], password: &str) -> io::Result<Zeroizing<Vec<u8>>> {
+fn decrypt_data(data: &[u8], password: &str) -> AppResult<Zeroizing<Vec<u8>>> {
     if data.len() < 12 + 16 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid file"));
+        return Err(AppError::InvalidData("File size is too small".to_string()));
     }
     let (nonce_bytes, rest) = data.split_at(12);
     let (salt, ciphertext) = rest.split_at(16);
 
-    let key = derive_key(password, salt);
+    let key = derive_key(password, salt)?;
     let cipher = Aes256Gcm::new(&key);
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
+        .map_err(|_| AppError::Crypto)?;
     
     Ok(Zeroizing::new(plaintext))
 }
 
-fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> io::Result<()> {
-    let key = derive_key(password, &data.salt);
+fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()> {
+    let key = derive_key(password, &data.salt)?;
     let cipher = Aes256Gcm::new(&key);
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let plaintext = serde_json::to_vec(data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Serialization failed: {}", e)))?;
+    let plaintext = serde_json::to_vec(data)?;
     
     let ciphertext = cipher.encrypt(nonce, plaintext.as_ref())
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Encryption failed"))?;
+        .map_err(|_| AppError::Crypto)?;
 
     let mut file_data = Vec::new();
     file_data.extend_from_slice(&nonce_bytes);
@@ -198,28 +233,27 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> io::Result<(
     Ok(())
 }
 
-fn decrypt_store(path: &Path, password: &str) -> io::Result<StoredData> {
+fn decrypt_store(path: &Path, password: &str) -> AppResult<StoredData> {
     let mut f = File::open(path)?;
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
 
     if data.len() < 12 + 16 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small"));
+        return Err(AppError::InvalidData("File size is too small".to_string()));
     }
 
     let (nonce_bytes, rest) = data.split_at(12);
     let (salt, ciphertext) = rest.split_at(16);
 
-    let key = derive_key(password, salt);
+    let key = derive_key(password, salt)?;
     let cipher = Aes256Gcm::new(&key);
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
+        .map_err(|_| AppError::Crypto)?;
     
     let plaintext_zeroizing = Zeroizing::new(plaintext);
-    let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "json decode failed"))?;
+    let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)?;
     
     Ok(parsed)
 }
@@ -305,7 +339,7 @@ fn generate_otp(entry: &OtpEntry) -> Option<(String, u64)> {
 }
 
 
-fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
+fn get_backup_path_interactive(is_encrypted: bool) -> AppResult<PathBuf> {
     print!("Enter the full path of the folder where the backup will be saved. Example:(/home/user/Desktop): ");
     io::stdout().flush()?;
     let mut dir_input = String::new();
@@ -315,7 +349,7 @@ fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
 
     if !dir_path.exists() || !dir_path.is_dir() {
         println!("The specified folder does not exist.");
-        return Err(io::Error::new(io::ErrorKind::NotFound, "Folder not found"));
+        return Err(AppError::InvalidData("The folder could not be found".to_string()));
     }
 
     print!("Enter the file name (without extension): ");
@@ -325,7 +359,7 @@ fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
     let name_input = name_input.trim();
     if name_input.is_empty() {
         println!("Invalid file name.");
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid name"));
+        return Err(AppError::InvalidData("Invalid file name".to_string()));
     }
 
     let mut full_path = dir_path.join(name_input);
@@ -342,7 +376,7 @@ fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
         io::stdin().read_line(&mut answer)?;
         if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
             println!("The transaction has been canceled.");
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "user cancelled"));
+            return Err(AppError::Cancelled("User cancellation".to_string()));
         }
     }
 
@@ -361,7 +395,7 @@ fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> String {
 }
 
 
-fn backup_codes(store: &StoredData) -> io::Result<()> {
+fn backup_codes(store: &StoredData) -> AppResult<()> {
     if store.entries.is_empty() {
         println!("No accounts have been registered yet.");
         return Ok(());
@@ -378,7 +412,8 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
     let is_enc = choice == "2";
     let backup_path = match get_backup_path_interactive(is_enc) {
         Ok(p) => p,
-        Err(_) => return Ok(()),
+        Err(AppError::Cancelled(_)) => return Ok(()),
+        Err(e) => return Err(e),
     };
 
     let mut plaintext = Zeroizing::new(String::new());
@@ -389,10 +424,10 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
     if is_enc {
         print!("Enter the back up password: ");
         io::stdout().flush()?;
-        let pass1 = Zeroizing::new(read_password().expect("Password could not be read"));
+        let pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         print!("Entry password again: ");
         io::stdout().flush()?;
-        let pass2 = Zeroizing::new(read_password().expect("Password could not be read"));
+        let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
 
         let trimmed_pass1 = pass1.trim();
         let trimmed_pass2 = pass2.trim();
@@ -411,6 +446,7 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
             },
             Err(e) => {
                 println!("Backup encryption failed: {}", e);
+                return Err(e);
             }
         }
     } else {
@@ -519,8 +555,8 @@ fn import_from_text(text: &str, store: &mut StoredData) -> usize {
     added
 }
 
-fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
-    print!("Enter the full path of the backup file you want to upload: ");
+fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
+    print!("Enter the full path of the backup file you want to upload. Example:(/home/user/Desktop/backup.txt or backup.enc): ");
     io::stdout().flush()?;
     let mut path_input = String::new();
     io::stdin().read_line(&mut path_input)?;
@@ -538,16 +574,19 @@ fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
     let added = if backup_path.extension().and_then(|s| s.to_str()) == Some("enc") {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
-        let pass = Zeroizing::new(read_password().expect("The password could not be read."));
+        let pass = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         match decrypt_data(&data, pass.trim()) {
             Ok(plaintext) => {
                 let text = String::from_utf8_lossy(&*plaintext);
                 let count = import_from_text(&text, store);
                 count
             }
-            Err(_) => {
+            Err(AppError::Crypto | AppError::Argon2Hash(_) | AppError::Argon2(_) | AppError::Argon2Params(_) | AppError::InvalidData(_)) => {
                 println!("The password is incorrect or the file is corrupted.");
                 return Ok(());
+            }
+            Err(e) => {
+                return Err(e);
             }
         }
     } else {
@@ -559,7 +598,7 @@ fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
     Ok(())
 }
 
-fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Result<()> {
+fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
     print!("Account name to edit: ");
     io::stdout().flush()?;
     let mut name = String::new();
@@ -576,8 +615,8 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Resu
              name, entry.otp_type, entry.algorithm, entry.digits);
     
     println!("1) Rename account");
-    println!("2) Update secret");
-    println!("3) Update parameters (Type/Algo/Digits/Step/Counter)");
+    println!("2) Change secret");
+    println!("3) Change parameters (Type, Algorithm, Digits, Step/Counter)");
     println!("4) Cancel");
     print!("Choice: ");
     io::stdout().flush()?;
@@ -720,7 +759,7 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Resu
 }
 
 
-fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) -> io::Result<()> {
+fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
     print!("Account name: ");
     io::stdout().flush()?;
     let mut name = String::new();
@@ -835,7 +874,7 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
 }
 
 
-fn main() -> io::Result<()> {
+fn main() -> AppResult<()> {
     println!(r" $$\   $$\                  $$$$$$\              $$\     $$\       ");
     println!(r" $$ | $$  |                $$  __$$\             $$ |    $$ |      ");
     println!(r" $$ |$$  /  $$$$$$\        $$ /  $$ |$$\   $$\ $$$$$$\   $$$$$$$\  ");
@@ -861,14 +900,14 @@ fn main() -> io::Result<()> {
     if any_store {
         print!("Enter your password: ");
         io::stdout().flush()?;
-        password = Zeroizing::new(read_password().expect("The password could not be read."));
+        password = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
     } else {
         print!("Set a new password: ");
         io::stdout().flush()?;
-        let first = Zeroizing::new(read_password().expect("The password could not be read."));
+        let first = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         print!("Re-enter password: ");
         io::stdout().flush()?;
-        let second = Zeroizing::new(read_password().expect("The password could not be read."));
+        let second = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         if first.trim() != second.trim() {
             println!("Passwords do not match. Exiting.");
             return Ok(());
@@ -885,9 +924,13 @@ fn main() -> io::Result<()> {
                 println!("\nStore loaded successfully: {}", path.display());
                 store = data;
             },
-            Err(e) => {
+            Err(AppError::Crypto | AppError::Argon2Hash(_) | AppError::InvalidData(_)) => {
                 eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.display());
                 eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
+                return Err(AppError::InvalidData("Password decryption or file corruption".to_string()));
+            }
+            Err(e) => {
+                eprintln!("\nCritical error accessing store file '{}': {}", path.display(), e);
                 return Err(e);
             }
         }
@@ -907,8 +950,6 @@ fn main() -> io::Result<()> {
         println!("6) Backup codes");
         println!("7) Restore codes");
         println!("8) Exit");
-        print!("Choice: ");
-        io::stdout().flush()?;
 
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
@@ -960,8 +1001,11 @@ fn main() -> io::Result<()> {
                 io::stdin().read_line(&mut name)?;
                 let name = name.trim();
                 if store.entries.remove(name).is_some() {
-                    encrypt_store(&path, &password, &store)?;
-                    println!("Account '{}' deleted.", name);
+                    if let Err(e) = encrypt_store(&path, &password, &store) {
+                        println!("Warning: Could not save store after deletion: {}", e);
+                    } else {
+                        println!("Account '{}' deleted.", name);
+                    }
                 } else {
                     println!("Account '{}' not found.", name);
                 }
@@ -1001,4 +1045,162 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_base32_valid() {
+        assert!(validate_base32("JBSWY3DPEHPK3PXP").is_ok());
+        assert!(validate_base32("GEZDGNBVGY3TQOJQ").is_ok());
+    }
+
+    #[test]
+    fn test_validate_base32_invalid() {
+        assert!(validate_base32("INVALID!@#$").is_err());
+        assert!(validate_base32("").is_err());
+        assert!(validate_base32("123456789").is_err());
+    }
+
+    #[test]
+    fn test_validate_base32_with_spaces() {
+        assert!(validate_base32("JBSW Y3DP EHPK 3PXP").is_ok());
+    }
+
+    #[test]
+    fn test_calculate_totp_sha1() {
+        let secret = Zeroizing::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string());
+        
+        let result = calculate_otp(&secret, 1, OtpAlgorithm::Sha1, 6);
+        
+        assert!(result.is_some());
+        let code = result.unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_numeric()));
+    }
+
+    #[test]
+    fn test_calculate_totp_8_digits() {
+        let secret = Zeroizing::new("JBSWY3DPEHPK3PXP".to_string());
+        let result = calculate_otp(&secret, 1, OtpAlgorithm::Sha1, 8);
+        
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 8); 
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_data() {
+        let original_data = b"Hello, this is a secret message!";
+        let password = "super_secret_password";
+        
+        let encrypted = encrypt_data(original_data, password).unwrap();
+        
+        assert_ne!(encrypted.as_slice(), original_data);
+        
+        let decrypted = decrypt_data(&encrypted, password).unwrap();
+        
+        assert_eq!(&*decrypted, original_data);
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_password() {
+        let original_data = b"Secret data";
+        let password = "correct_password";
+        let wrong_password = "wrong_password";
+        
+        let encrypted = encrypt_data(original_data, password).unwrap();
+        
+        let result = decrypt_data(&encrypted, wrong_password);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_otp_entry_serialization() {
+        let entry = OtpEntry {
+            secret: Zeroizing::new("JBSWY3DPEHPK3PXP".to_string()),
+            otp_type: OtpType::Totp,
+            algorithm: OtpAlgorithm::Sha1,
+            digits: 6,
+            step: 30,
+            counter: 0,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        
+        let deserialized: OtpEntry = serde_json::from_str(&json).unwrap();
+       
+        assert_eq!(deserialized.otp_type, OtpType::Totp);
+        assert_eq!(deserialized.algorithm, OtpAlgorithm::Sha1);
+        assert_eq!(deserialized.digits, 6);
+        assert_eq!(deserialized.step, 30);
+    }
+
+    #[test]
+    fn test_import_from_text() {
+        let backup_text = r#"Account: TestAccount
+Secret: JBSWY3DPEHPK3PXP
+Type: Totp
+Algorithm: Sha1
+Digits: 6
+Step: 30
+
+Account: TestAccount2
+Secret: GEZDGNBVGY3TQOJQ
+Type: Hotp
+Algorithm: Sha256
+Digits: 8
+Counter: 5
+"#;
+
+        let mut store = StoredData {
+            entries: HashMap::new(),
+            salt: vec![0u8; 16],
+        };
+
+        let added = import_from_text(backup_text, &mut store);
+        
+        assert_eq!(added, 2); 
+        assert!(store.entries.contains_key("TestAccount"));
+        assert!(store.entries.contains_key("TestAccount2"));
+        
+        let entry1 = store.entries.get("TestAccount").unwrap();
+        assert_eq!(entry1.otp_type, OtpType::Totp);
+        assert_eq!(entry1.digits, 6);
+        
+        let entry2 = store.entries.get("TestAccount2").unwrap();
+        assert_eq!(entry2.otp_type, OtpType::Hotp);
+        assert_eq!(entry2.counter, 5);
+    }
+
+    #[test]
+    fn test_calculate_otp_invalid_secret() {
+        let invalid_secret = Zeroizing::new("INVALID!!!".to_string());
+        let result = calculate_otp(&invalid_secret, 1, OtpAlgorithm::Sha1, 6);
+        
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_remaining_seconds() {
+        let step = 30u64;
+        let remaining = get_remaining_seconds(step);
+        
+        assert!(remaining > 0 && remaining <= step);
+    }
+
+    #[test]
+    fn test_derive_key_performance() {
+        use std::time::Instant;
+        
+        let password = "test_password";
+        let salt = [0u8; 16];
+        
+        let start = Instant::now();
+        let _key = derive_key(password, &salt).unwrap();
+        let duration = start.elapsed();
+        
+        assert!(duration.as_secs() < 60);
+    }
 }
