@@ -21,6 +21,7 @@ use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
 use thiserror::Error; 
+use typenum::{U12, U32}; 
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -165,19 +166,32 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum
     Ok(GenericArray::clone_from_slice(&*key))
 }
 
+fn core_encrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, data: &[u8]) -> AppResult<Vec<u8>> {
+    let cipher = Aes256Gcm::new(key);
+    cipher.encrypt(nonce, data)
+        .map_err(|_| AppError::Crypto)
+}
+
+fn core_decrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, ciphertext: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
+    let cipher = Aes256Gcm::new(key);
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|_| AppError::Crypto)?;
+    
+    Ok(Zeroizing::new(plaintext))
+}
+
+
 fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
 
     let key = derive_key(password, &salt)?;
-    let cipher = Aes256Gcm::new(&key);
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, data)
-        .map_err(|_| AppError::Crypto)?;
+    let ciphertext = core_encrypt(&key, nonce, data)?; 
 
     let mut result = Vec::new();
     result.extend_from_slice(&nonce_bytes);
@@ -194,18 +208,13 @@ fn decrypt_data(data: &[u8], password: &str) -> AppResult<Zeroizing<Vec<u8>>> {
     let (salt, ciphertext) = rest.split_at(16);
 
     let key = derive_key(password, salt)?;
-    let cipher = Aes256Gcm::new(&key);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|_| AppError::Crypto)?;
-    
-    Ok(Zeroizing::new(plaintext))
+    core_decrypt(&key, nonce, ciphertext) 
 }
 
 fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()> {
     let key = derive_key(password, &data.salt)?;
-    let cipher = Aes256Gcm::new(&key);
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -213,8 +222,7 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()
 
     let plaintext = serde_json::to_vec(data)?;
     
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_ref())
-        .map_err(|_| AppError::Crypto)?;
+    let ciphertext = core_encrypt(&key, nonce, plaintext.as_ref())?; 
 
     let mut file_data = Vec::new();
     file_data.extend_from_slice(&nonce_bytes);
@@ -246,13 +254,10 @@ fn decrypt_store(path: &Path, password: &str) -> AppResult<StoredData> {
     let (salt, ciphertext) = rest.split_at(16);
 
     let key = derive_key(password, salt)?;
-    let cipher = Aes256Gcm::new(&key);
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|_| AppError::Crypto)?;
+    let plaintext_zeroizing = core_decrypt(&key, nonce, ciphertext)?; 
     
-    let plaintext_zeroizing = Zeroizing::new(plaintext);
     let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)?;
     
     Ok(parsed)
@@ -1033,7 +1038,11 @@ fn main() -> AppResult<()> {
                 if let Err(e) = restore_codes_interactive(&mut store) {
                     println!("Restore error: {}", e);
                 } else {
-                    encrypt_store(&path, &password, &store)?;
+                    if store.entries.len() > 0 {
+                       if let Err(e) = encrypt_store(&path, &password, &store) {
+                           println!("Warning: Could not save store after successful restore: {}", e);
+                       }
+                    }
                 }
             }
             "8" => {
