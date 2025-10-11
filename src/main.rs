@@ -340,6 +340,18 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
             }
         }
     } else {
+        println!("\n!!! SECURITY WARNING !!!");
+        println!("Please note that this file is unecrypted. Anyone with access to the file can read it. Please be aware of this risk.");
+        print!("To continue, type ‘YES’ in capital letters: ");
+        io::stdout().flush()?;
+        let mut confirmation = String::new();
+        io::stdin().read_line(&mut confirmation)?;
+        
+        if confirmation.trim() != "YES" {
+            println!("Plain text backup cancelled by user.");
+            return Ok(());
+        }
+        
         let mut f = File::create(&backup_path)?;
         f.write_all(plaintext.as_bytes())?;
         println!("Plain text backup completed: {}", backup_path.display());
@@ -347,7 +359,6 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
 
     Ok(())
 }
-
 fn import_from_text(text: &str, store: &mut StoredData) -> usize {
     let mut added = 0;
     for block in text.split("\n\n") {
