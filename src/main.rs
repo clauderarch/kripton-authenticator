@@ -189,8 +189,38 @@ fn decrypt_store(path: &Path, password: &str) -> io::Result<StoredData> {
     Ok(parsed)
 }
 
+// NEW: Validate base32 secret
+fn validate_base32(secret: &str) -> Result<(), String> {
+    if secret.is_empty() {
+        return Err("Secret cannot be empty".to_string());
+    }
+    
+    // Remove spaces and convert to uppercase for validation
+    let cleaned = secret.replace(" ", "").to_uppercase();
+    
+    // Check if all characters are valid base32
+    for ch in cleaned.chars() {
+        if !matches!(ch, 'A'..='Z' | '2'..='7' | '=') {
+            return Err(format!("Invalid character '{}' in base32 secret. Only A-Z, 2-7, and = are allowed.", ch));
+        }
+    }
+    
+    // Try to decode to verify it's valid
+    match decode(Alphabet::RFC4648 { padding: false }, &cleaned) {
+        Some(_) => Ok(()),
+        None => Err("Invalid base32 format. Please check your secret.".to_string()),
+    }
+}
+
+// NEW: Get remaining seconds until next code
+fn get_remaining_seconds() -> u64 {
+    30 - ((Utc::now().timestamp() % 30) as u64)
+}
+
 fn generate_totp(secret_b32: &str) -> Option<String> {
-    let secret = decode(Alphabet::RFC4648 { padding: false }, secret_b32)?;
+    // Clean the secret (remove spaces, convert to uppercase)
+    let cleaned = secret_b32.replace(" ", "").to_uppercase();
+    let secret = decode(Alphabet::RFC4648 { padding: false }, &cleaned)?;
     let timestep = (Utc::now().timestamp() / 30) as u64;
     let counter = timestep.to_be_bytes();
 
@@ -371,6 +401,79 @@ fn restore_codes_interactive(store: &mut StoredData) -> io::Result<()> {
     Ok(())
 }
 
+// NEW: Edit account function
+fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> io::Result<()> {
+    print!("Account name to edit: ");
+    io::stdout().flush()?;
+    let mut name = String::new();
+    io::stdin().read_line(&mut name)?;
+    let name = name.trim();
+    
+    if !store.entries.contains_key(name) {
+        println!("Account '{}' not found.", name);
+        return Ok(());
+    }
+    
+    println!("\nEditing account: {}", name);
+    println!("1) Rename account");
+    println!("2) Update secret");
+    println!("3) Cancel");
+    print!("Choice: ");
+    io::stdout().flush()?;
+    
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    
+    match choice.trim() {
+        "1" => {
+            print!("Enter new name: ");
+            io::stdout().flush()?;
+            let mut new_name = String::new();
+            io::stdin().read_line(&mut new_name)?;
+            let new_name = new_name.trim().to_string();
+            
+            if new_name.is_empty() {
+                println!("Invalid name.");
+                return Ok(());
+            }
+            
+            if store.entries.contains_key(&new_name) && new_name != name {
+                println!("An account named '{}' already exists.", new_name);
+                return Ok(());
+            }
+            
+            if let Some(secret) = store.entries.remove(name) {
+                store.entries.insert(new_name.clone(), secret);
+                encrypt_store(path, password, store)?;
+                println!("Account renamed from '{}' to '{}'.", name, new_name);
+            }
+        }
+        "2" => {
+            print!("Enter new secret (base32): ");
+            io::stdout().flush()?;
+            let mut secret = String::new();
+            io::stdin().read_line(&mut secret)?;
+            let secret = secret.trim().to_string();
+            
+            // Validate the secret
+            if let Err(e) = validate_base32(&secret) {
+                println!("Invalid secret: {}", e);
+                return Ok(());
+            }
+            
+            store.entries.insert(name.to_string(), secret);
+            encrypt_store(path, password, store)?;
+            println!("Secret updated for '{}'.", name);
+        }
+        "3" => {
+            println!("Edit cancelled.");
+        }
+        _ => println!("Invalid choice."),
+    }
+    
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     println!(r" $$\   $$\                  $$$$$$\              $$\     $$\       ");
     println!(r" $$ | $$  |                $$  __$$\             $$ |    $$ |      ");
@@ -438,11 +541,12 @@ fn main() -> io::Result<()> {
     loop {
         println!("\n1) Add account");
         println!("2) Get code");
-        println!("3) Delete account");
-        println!("4) List accounts");
-        println!("5) Backup codes");
-        println!("6) Restore codes");
-        println!("7) Exit");
+        println!("3) Edit account");
+        println!("4) Delete account");
+        println!("5) List accounts");
+        println!("6) Backup codes");
+        println!("7) Restore codes");
+        println!("8) Exit");
         print!("Choice: ");
         io::stdout().flush()?;
 
@@ -456,7 +560,7 @@ fn main() -> io::Result<()> {
                 io::stdin().read_line(&mut name)?;
                 let name = name.trim().to_string();
                 if name.is_empty() {
-                    println!("Invaild name");
+                    println!("Invalid name");
                     continue;
                 }
                 if store.entries.contains_key(&name) {
@@ -468,6 +572,13 @@ fn main() -> io::Result<()> {
                 let mut secret = String::new();
                 io::stdin().read_line(&mut secret)?;
                 let secret = secret.trim().to_string();
+                
+                // Validate secret before saving
+                if let Err(e) = validate_base32(&secret) {
+                    println!("Error: {}", e);
+                    continue;
+                }
+                
                 store.entries.insert(name.clone(), secret);
                 encrypt_store(&path, &password, &store)?;
                 println!("'{}' saved.", name);
@@ -480,15 +591,22 @@ fn main() -> io::Result<()> {
                 let name = name.trim();
                 if let Some(secret) = store.entries.get(name) {
                     if let Some(code) = generate_totp(secret) {
-                        println!("Code: {}", code);
+                        let remaining = get_remaining_seconds();
+                        println!("\nCode: {}", code);
+                        println!("Valid for {} more seconds", remaining);
                     } else {
-                        println!("Failed to generate code.");
+                        println!("Failed to generate code. The secret may be invalid.");
                     }
                 } else {
                     println!("Account not found.");
                 }
             }
             "3" => {
+                if let Err(e) = edit_account(&mut store, &path, &password) {
+                    println!("Edit error: {}", e);
+                }
+            }
+            "4" => {
                 print!("Account to delete: ");
                 io::stdout().flush()?;
                 let mut name = String::new();
@@ -501,7 +619,7 @@ fn main() -> io::Result<()> {
                     println!("Account '{}' not found.", name);
                 }
             }
-            "4" => {
+            "5" => {
                 if store.entries.is_empty() {
                     println!("No accounts saved yet.");
                 } else {
@@ -513,19 +631,19 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-            "5" => {
+            "6" => {
                 if let Err(e) = backup_codes(&store) {
                     println!("Backup error: {}", e);
                 }
             }
-            "6" => {
+            "7" => {
                 if let Err(e) = restore_codes_interactive(&mut store) {
                     println!("Restore error: {}", e);
                 } else {
                     encrypt_store(&path, &password, &store)?;
                 }
             }
-            "7" => {
+            "8" => {
                 println!("Exiting...");
                 break;
             }
