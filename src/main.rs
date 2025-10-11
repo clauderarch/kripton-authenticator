@@ -54,13 +54,6 @@ struct StoredData {
     salt: Vec<u8>,
 }
 
-#[derive(Deserialize, Debug)]
-struct OldStoredData {
-    entries: HashMap<String, String>,
-    salt: Vec<u8>,
-}
-
-
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
 const ARGON2_PARALLELISM: u32 = 4; 
@@ -225,43 +218,10 @@ fn decrypt_store(path: &Path, password: &str) -> io::Result<StoredData> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption failed"))?;
     
     let plaintext_zeroizing = Zeroizing::new(plaintext);
+    let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "json decode failed"))?;
     
-    match serde_json::from_slice::<StoredData>(&*plaintext_zeroizing) {
-        Ok(parsed) => {
-            println!("INFO: Store successfully loaded using NEW structure.");
-            Ok(parsed)
-        }
-        Err(new_struct_err) => {
-            eprintln!("WARNING: Failed to parse with new structure. Trying old structure...");
-
-            match serde_json::from_slice::<OldStoredData>(&*plaintext_zeroizing) {
-                Ok(old_data) => {
-                    println!("INFO: Store successfully loaded using OLD structure. Migrating data to new format...");
-                    
-                    let mut new_entries = HashMap::new();
-                    for (name, secret_b32_string) in old_data.entries {
-                        let entry = OtpEntry {
-                            secret: Zeroizing::new(secret_b32_string),
-                            otp_type: OtpType::Totp,
-                            algorithm: OtpAlgorithm::Sha1,
-                            digits: 6,
-                            step: 30,
-                            counter: 0,
-                        };
-                        new_entries.insert(name, entry);
-                    }
-
-                    Ok(StoredData {
-                        entries: new_entries,
-                        salt: old_data.salt,
-                    })
-                }
-                Err(old_struct_err) => {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "json decode failed (File structure mismatch or corruption)"))
-                }
-            }
-        }
-    }
+    Ok(parsed)
 }
 
 fn validate_base32(secret: &str) -> Result<(), String> {
@@ -290,8 +250,11 @@ fn get_remaining_seconds(step: u64) -> u64 {
 fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<String> {
     let cleaned = secret_b32.replace(" ", "").to_uppercase();
     let secret_bytes = decode(Alphabet::Rfc4648 { padding: false }, &cleaned)?;
+    
     let secret = Zeroizing::new(secret_bytes);
+    
     let counter_bytes = counter.to_be_bytes();
+
     let result = match algorithm {
         OtpAlgorithm::Sha1 => {
             let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
@@ -335,6 +298,7 @@ fn generate_otp(entry: &OtpEntry) -> Option<(String, u64)> {
         }
         OtpType::Hotp => {
             let code = calculate_otp(&entry.secret, entry.counter, entry.algorithm, entry.digits)?;
+            
             Some((code, 0))
         }
     }
@@ -451,7 +415,7 @@ fn backup_codes(store: &StoredData) -> io::Result<()> {
         }
     } else {
         println!("\n!!! SECURITY WARNING !!!");
-        println!("Please note that this file is unencrypted. Anyone with access to the file can read it. Please be aware of this risk.");
+        println!("Please note that this file is unecrypted. Anyone with access to the file can read it. Please be aware of this risk.");
         print!("To continue, type ‘YES’ in capital letters: ");
         io::stdout().flush()?;
         let mut confirmation = String::new();
@@ -519,7 +483,7 @@ fn import_from_text(text: &str, store: &mut StoredData) -> usize {
             otp_type,
             algorithm,
             digits,
-            step: 30, 
+            step: 30,
             counter: 0,
         };
 
@@ -922,7 +886,7 @@ fn main() -> io::Result<()> {
                 store = data;
             },
             Err(e) => {
-                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted. Detail: {}", path.display(), e);
+                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.display());
                 eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
                 return Err(e);
             }
