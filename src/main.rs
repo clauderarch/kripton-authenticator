@@ -17,8 +17,8 @@ use hmac::digest::KeyInit as HmacKeyInit;
 use serde::{Deserialize, Serialize};
 use rpassword::read_password;
 use sha2::{Digest, Sha256};
-
 use argon2::{Argon2, Params, Version, Algorithm};
+use directories::ProjectDirs;
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 
@@ -28,12 +28,55 @@ struct StoredData {
     salt: Vec<u8>,
 }
 
-
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
 const ARGON2_PARALLELISM: u32 = 4; 
 
 const STORE_FILE_BASE: &str = "auth_store";
+
+fn get_project_dirs() -> io::Result<PathBuf> {
+    if let Some(proj_dirs) = ProjectDirs::from("com", "YourOrg", "RustAuthenticator") {
+        let data_dir = proj_dirs.data_dir();
+        fs::create_dir_all(data_dir)?;
+        Ok(data_dir.to_path_buf())
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "Could not find a valid home directory."))
+    }
+}
+
+fn store_path_for_password(password: &str) -> io::Result<PathBuf> {
+    let data_dir = get_project_dirs()?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    let result = hasher.finalize();
+    let hexdigest = format!("{:x}", result);
+    let prefix = &hexdigest[..8];
+    let file_name = format!("{}_{}.enc", STORE_FILE_BASE, prefix);
+    
+    Ok(data_dir.join(file_name))
+}
+
+fn any_store_files_exist() -> io::Result<bool> {
+    let data_dir = match get_project_dirs() {
+        Ok(dir) => dir,
+        Err(_) => return Ok(false), 
+    };
+
+    if !data_dir.exists() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(data_dir)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with(&format!("{}_", STORE_FILE_BASE)) && name.ends_with(".enc") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
 
 fn derive_key(password: &str, salt: &[u8]) -> GenericArray<u8, typenum::U32> {
     let params = Params::new(
@@ -162,27 +205,6 @@ fn generate_totp(secret_b32: &str) -> Option<String> {
         | (u32::from(result[offset + 3]) & 0xff);
 
     Some(format!("{:06}", code % 1_000_000))
-}
-
-fn store_path_for_password(password: &str) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    let result = hasher.finalize();
-    let hexdigest = format!("{:x}", result);
-    let prefix = &hexdigest[..8];
-    PathBuf::from(format!("{}_{}.enc", STORE_FILE_BASE, prefix))
-}
-
-fn any_store_files_exist() -> io::Result<bool> {
-    for entry in fs::read_dir(".")? {
-        let entry = entry?;
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with(&format!("{}_", STORE_FILE_BASE)) && name.ends_with(".enc") {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 fn get_backup_path_interactive(is_encrypted: bool) -> io::Result<PathBuf> {
@@ -389,24 +411,25 @@ fn main() -> io::Result<()> {
         }
         password = first.trim().to_string();
     }
+    
 
-    let path = store_path_for_password(&password);
+    let path = store_path_for_password(&password)?;
     let mut store;
 
     if path.exists() {
         match decrypt_store(&path, &password) {
             Ok(data) => {
-                println!("\nStore loaded successfully: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                println!("\nStore loaded successfully: {}", path.display());
                 store = data;
             },
             Err(e) => {
-                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.file_name().unwrap_or_default().to_string_lossy());
+                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.display());
                 eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
                 return Err(e);
             }
         }
     } else {
-        println!("\nNo existing store found for this password. A new, encrypted file will be created upon saving the first account.");
+        println!("\nNo existing store found for this password. A new, encrypted file will be created at '{}' upon saving the first account.", path.display());
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
         store = StoredData { entries: HashMap::new(), salt: salt.to_vec() };
@@ -483,7 +506,9 @@ fn main() -> io::Result<()> {
                     println!("No accounts saved yet.");
                 } else {
                     println!("\nSaved Accounts:");
-                    for (i, name) in store.entries.keys().enumerate() {
+                    let mut sorted_keys: Vec<_> = store.entries.keys().collect();
+                    sorted_keys.sort_by_key(|a| a.to_lowercase());
+                    for (i, name) in sorted_keys.iter().enumerate() {
                         println!("{}. {}", i + 1, name);
                     }
                 }
