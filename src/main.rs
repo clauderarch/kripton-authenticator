@@ -36,7 +36,7 @@ const ARGON2_PARALLELISM: u32 = 4;
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn get_project_dirs() -> io::Result<PathBuf> {
-    if let Some(proj_dirs) = ProjectDirs::from("com", "YourOrg", "RustAuthenticator") {
+    if let Some(proj_dirs) = ProjectDirs::from("com", "YourOrg", "KriptonAuthenticator") {
         let data_dir = proj_dirs.data_dir();
         fs::create_dir_all(data_dir)?;
         Ok(data_dir.to_path_buf())
