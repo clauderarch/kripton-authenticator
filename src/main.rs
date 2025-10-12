@@ -385,6 +385,72 @@ fn copy_to_clipboard(text: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn levenshtein_distance(s1: &str, s2: &str) -> usize {
+    let len1 = s1.chars().count();
+    let len2 = s2.chars().count();
+    
+    if len1 == 0 {
+        return len2;
+    }
+    if len2 == 0 {
+        return len1;
+    }
+    
+    let mut prev_row: Vec<usize> = (0..=len2).collect();
+    let mut curr_row = vec![0; len2 + 1];
+    
+    for (i, c1) in s1.chars().enumerate() {
+        curr_row[0] = i + 1;
+        
+        for (j, c2) in s2.chars().enumerate() {
+            let cost = if c1 == c2 { 0 } else { 1 };
+            curr_row[j + 1] = std::cmp::min(
+                std::cmp::min(curr_row[j] + 1, prev_row[j + 1] + 1),
+                prev_row[j] + cost
+            );
+        }
+        
+        std::mem::swap(&mut prev_row, &mut curr_row);
+    }
+    
+    prev_row[len2]
+}
+
+fn suggest_similar_accounts(input: &str, entries: &HashMap<String, OtpEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    
+    let input_lower = input.to_lowercase();
+    let max_distance = 3;
+    
+    let mut suggestions: Vec<(String, usize)> = entries
+        .keys()
+        .filter_map(|name| {
+            let name_lower = name.to_lowercase();
+            let distance = levenshtein_distance(&input_lower, &name_lower);
+            
+            if distance <= max_distance || name_lower.contains(&input_lower) || input_lower.contains(&name_lower) {
+                Some((name.clone(), distance))
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    if suggestions.is_empty() {
+        return;
+    }
+    
+    suggestions.sort_by_key(|(_, dist)| *dist);
+    suggestions.truncate(5);
+    
+    println!("\nDid you mean:");
+    for (name, _) in suggestions {
+        println!("  - {}", name);
+    }
+}
+
 fn get_backup_path_interactive(is_encrypted: bool) -> AppResult<PathBuf> {
     print!("Enter the full path of the folder where the backup will be saved. Example:(/home/user/Desktop): ");
     io::stdout().flush()?;
@@ -645,6 +711,7 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
     
     if !store.entries.contains_key(name) {
         println!("Account '{}' not found.", name);
+        suggest_similar_accounts(name, &store.entries);
         return Ok(());
     }
     
@@ -933,13 +1000,13 @@ fn settings_menu(store: &mut StoredData, path: &Path, password: &str) -> AppResu
 }
 
 fn main() -> AppResult<()> {
-    println!(r" $$\   $$\                  $$$$$$\              $$\     $$\       ");
-    println!(r" $$ | $$  |                $$  __$$\             $$ |    $$ |      ");
-    println!(r" $$ |$$  /  $$$$$$\        $$ /  $$ |$$\   $$\ $$$$$$\   $$$$$$$\  ");
-    println!(r" $$$$$  /  $$  __$$\       $$$$$$$$ |$$ |  $$ |\_$$  _|  $$  __$$\ ");
-    println!(r" $$  $$<   $$ |  \__|      $$  __$$ |$$ |  $$ |  $$ |    $$ |  $$ |");
-    println!(r" $$ |\$$\  $$ |            $$ |  $$ |$$ |  $$ |  $$ |$$\ $$ |  $$ |");
-    println!(r" $$ | \$$\ $$ |            $$ |  $$ |\$$$$$$  |  \$$$$  |$$ |  $$ |");
+    println!(r" $\   $\                  $$$\              $\     $\       ");
+    println!(r" $ | $  |                $  __$\             $ |    $ |      ");
+    println!(r" $ |$  /  $$$\        $ /  $ |$\   $\ $$$\   $$$$\  ");
+    println!(r" $$$  /  $  __$\       $$$$ |$ |  $ |\_$  _|  $  __$\ ");
+    println!(r" $  $<   $ |  \__|      $  __$ |$ |  $ |  $ |    $ |  $ |");
+    println!(r" $ |\$\  $ |            $ |  $ |$ |  $ |  $ |$\ $ |  $ |");
+    println!(r" $ | \$\ $ |            $ |  $ |\$$$  |  \$$  |$ |  $ |");
     println!(r" \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|");
     println!("--------------------------------------------------");
     println!(" Attention:");
@@ -1058,6 +1125,7 @@ fn main() -> AppResult<()> {
                     }
                 } else {
                     println!("Account not found.");
+                    suggest_similar_accounts(name, &store.entries);
                 }
             }
             "3" => {
@@ -1079,6 +1147,7 @@ fn main() -> AppResult<()> {
                     }
                 } else {
                     println!("Account '{}' not found.", name);
+                    suggest_similar_accounts(name, &store.entries);
                 }
             }
             "5" => {
@@ -1227,6 +1296,7 @@ Counter: 5
         let mut store = StoredData {
             entries: HashMap::new(),
             salt: vec![0u8; SALT_SIZE],
+            settings: AppSettings::default(),
         };
         let added = import_from_text(backup_text, &mut store);
         assert_eq!(added, 2); 
@@ -1288,6 +1358,7 @@ Counter: 5
         let store = StoredData {
             entries,
             salt: salt.to_vec(),
+            settings: AppSettings::default(),
         };
         encrypt_store(&store_path, password, &store).unwrap();
         assert!(store_path.exists());
@@ -1309,6 +1380,7 @@ Counter: 5
         let store = StoredData {
             entries: HashMap::new(),
             salt: salt.to_vec(),
+            settings: AppSettings::default(),
         };
         
         File::create(&store_path).unwrap();
@@ -1332,6 +1404,7 @@ Counter: 5
         let store = StoredData {
             entries: HashMap::new(),
             salt: salt.to_vec(),
+            settings: AppSettings::default(),
         };
         for _ in 0..5 {
             encrypt_store(&store_path, password, &store).unwrap();
@@ -1362,6 +1435,7 @@ Counter: 5
                     let store = StoredData {
                         entries: HashMap::new(),
                         salt: salt.to_vec(),
+                        settings: AppSettings::default(),
                     };                   
                     encrypt_store(&store_path, &password, &store).unwrap();
                     
@@ -1382,5 +1456,49 @@ Counter: 5
             let path = entry.path();
             assert_eq!(path.extension().and_then(|s| s.to_str()), Some("enc"));
         }
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance("", ""), 0);
+        assert_eq!(levenshtein_distance("abc", "abc"), 0);
+        assert_eq!(levenshtein_distance("abc", "ab"), 1);
+        assert_eq!(levenshtein_distance("abc", "def"), 3);
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+        assert_eq!(levenshtein_distance("Saturday", "Sunday"), 3);
+    }
+
+    #[test]
+    fn test_suggest_similar_accounts_empty() {
+        let entries = HashMap::new();
+        suggest_similar_accounts("test", &entries);
+    }
+
+    #[test]
+    fn test_suggest_similar_accounts_with_matches() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "GitHub".to_string(),
+            OtpEntry {
+                secret: Zeroizing::new("JBSWY3DPEHPK3PXP".to_string()),
+                otp_type: OtpType::Totp,
+                algorithm: OtpAlgorithm::Sha1,
+                digits: 6,
+                step: 30,
+                counter: 0,
+            },
+        );
+        entries.insert(
+            "GitLab".to_string(),
+            OtpEntry {
+                secret: Zeroizing::new("JBSWY3DPEHPK3PXP".to_string()),
+                otp_type: OtpType::Totp,
+                algorithm: OtpAlgorithm::Sha1,
+                digits: 6,
+                step: 30,
+                counter: 0,
+            },
+        );
+        suggest_similar_accounts("Githb", &entries);
     }
 }
