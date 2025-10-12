@@ -24,6 +24,10 @@ You can install it using an AUR helper like `yay`:
 ```bash
 yay -S kripton-authenticator
 ```
+**or**
+```bash
+yay -S kripton-authenticator-bin
+```
 ### Build from Source (Recommended for other Linux Distributions)
 
 **1. Clone the repository:**
