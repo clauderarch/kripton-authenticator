@@ -10,6 +10,9 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, generic_array::GenericArray, rand_core::RngCore},
     Aes256Gcm, Nonce,
 };
+use arboard::Clipboard;
+#[cfg(target_os = "linux")]
+use arboard::SetExtLinux;
 use base32::{Alphabet, decode};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -21,7 +24,7 @@ use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
 use thiserror::Error; 
-use typenum::{U12, U32}; 
+use typenum::{U12, U32};
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -41,6 +44,8 @@ enum AppError {
     InvalidData(String),
     #[error("The transaction was canceled by the user: {0}")]
     Cancelled(String),
+    #[error("Clipboard error: {0}")]
+    Clipboard(String),
 }
 
 impl From<argon2::password_hash::Error> for AppError {
@@ -55,10 +60,20 @@ impl From<argon2::Error> for AppError {
     }
 }
 
+impl From<arboard::Error> for AppError {
+    fn from(err: arboard::Error) -> Self {
+        AppError::Clipboard(err.to_string())
+    }
+}
+
 type AppResult<T> = Result<T, AppError>;
 type HmacSha1 = Hmac<sha1::Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
+
+const NONCE_SIZE: usize = 12;
+const SALT_SIZE: usize = 16;
+const KEY_SIZE: usize = 32;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 enum OtpType {
@@ -83,11 +98,27 @@ struct OtpEntry {
     counter: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AppSettings {
+    auto_copy_to_clipboard: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings {
+            auto_copy_to_clipboard: true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct StoredData {
     entries: HashMap<String, OtpEntry>,
     salt: Vec<u8>,
+    #[serde(default)]
+    settings: AppSettings,
 }
+
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
 const ARGON2_PARALLELISM: u32 = 4; 
@@ -142,7 +173,7 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum
         ARGON2_MEMORY,
         ARGON2_TIME,
         ARGON2_PARALLELISM,
-        Some(32),
+        Some(KEY_SIZE),
     )
     .map_err(|e| AppError::Argon2Params(e.to_string()))?;
     let argon2 = Argon2::new(
@@ -151,7 +182,7 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum
         params,
     );
 
-    let mut key = Zeroizing::new([0u8; 32]);
+    let mut key = Zeroizing::new([0u8; KEY_SIZE]);
     argon2.hash_password_into(
         password.as_bytes(),
         salt,
@@ -166,6 +197,7 @@ fn core_encrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, data: &[u8]) ->
     cipher.encrypt(nonce, data)
         .map_err(|_| AppError::Crypto)
 }
+
 fn core_decrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, ciphertext: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
     let cipher = Aes256Gcm::new(key);
     let plaintext = cipher.decrypt(nonce, ciphertext)
@@ -173,12 +205,11 @@ fn core_decrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, ciphertext: &[u
     Ok(Zeroizing::new(plaintext))
 }
 
-
 fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
-    let mut salt = [0u8; 16];
+    let mut salt = [0u8; SALT_SIZE];
     OsRng.fill_bytes(&mut salt);
     let key = derive_key(password, &salt)?;
-    let mut nonce_bytes = [0u8; 12];
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = core_encrypt(&key, nonce, data)?; 
@@ -190,11 +221,11 @@ fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
 }
 
 fn decrypt_data(data: &[u8], password: &str) -> AppResult<Zeroizing<Vec<u8>>> {
-    if data.len() < 12 + 16 {
+    if data.len() < NONCE_SIZE + SALT_SIZE {
         return Err(AppError::InvalidData("File size is too small".to_string()));
     }
-    let (nonce_bytes, rest) = data.split_at(12);
-    let (salt, ciphertext) = rest.split_at(16);
+    let (nonce_bytes, rest) = data.split_at(NONCE_SIZE);
+    let (salt, ciphertext) = rest.split_at(SALT_SIZE);
     let key = derive_key(password, salt)?;
     let nonce = Nonce::from_slice(nonce_bytes);
     core_decrypt(&key, nonce, ciphertext) 
@@ -202,7 +233,7 @@ fn decrypt_data(data: &[u8], password: &str) -> AppResult<Zeroizing<Vec<u8>>> {
 
 fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()> {
     let key = derive_key(password, &data.salt)?;
-    let mut nonce_bytes = [0u8; 12];
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plaintext = serde_json::to_vec(data)?;
@@ -246,11 +277,11 @@ fn decrypt_store(path: &Path, password: &str) -> AppResult<StoredData> {
     let mut f = File::open(path)?;
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
-    if data.len() < 12 + 16 {
+    if data.len() < NONCE_SIZE + SALT_SIZE {
         return Err(AppError::InvalidData("File size is too small".to_string()));
     }
-    let (nonce_bytes, rest) = data.split_at(12);
-    let (salt, ciphertext) = rest.split_at(16);
+    let (nonce_bytes, rest) = data.split_at(NONCE_SIZE);
+    let (salt, ciphertext) = rest.split_at(SALT_SIZE);
     let key = derive_key(password, salt)?;
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext_zeroizing = core_decrypt(&key, nonce, ciphertext)?; 
@@ -329,12 +360,30 @@ fn generate_otp(entry: &OtpEntry) -> Option<(String, u64)> {
         }
         OtpType::Hotp => {
             let code = calculate_otp(&entry.secret, entry.counter, entry.algorithm, entry.digits)?;
-            
             Some((code, 0))
         }
     }
 }
 
+fn copy_to_clipboard(text: &str) -> AppResult<()> {
+    let mut clipboard = Clipboard::new()?;
+    
+    #[cfg(target_os = "linux")]
+    {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(100);
+        clipboard.set()
+            .wait_until(deadline)
+            .text(text)?;
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        clipboard.set_text(text)?;
+    }
+    
+    Ok(())
+}
 
 fn get_backup_path_interactive(is_encrypted: bool) -> AppResult<PathBuf> {
     print!("Enter the full path of the folder where the backup will be saved. Example:(/home/user/Desktop): ");
@@ -366,12 +415,12 @@ fn get_backup_path_interactive(is_encrypted: bool) -> AppResult<PathBuf> {
     }
 
     if full_path.exists() {
-        print!("{} already exists, should we write on it? (Y/N): ", full_path.display());
+        print!("{} already exists. Overwrite? (Y/N): ", full_path.display());
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
         if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-            println!("The transaction has been canceled.");
+            println!("Operation cancelled.");
             return Err(AppError::Cancelled("User cancellation".to_string()));
         }
     }
@@ -390,10 +439,9 @@ fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> String {
     s
 }
 
-
 fn backup_codes(store: &StoredData) -> AppResult<()> {
     if store.entries.is_empty() {
-        println!("No accounts have been registered yet.");
+        println!("No accounts registered yet.");
         return Ok(());
     }
 
@@ -417,16 +465,16 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
     }
 
     if is_enc {
-        print!("Enter the back up password: ");
+        print!("Enter the backup password: ");
         io::stdout().flush()?;
         let pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-        print!("Entry password again: ");
+        print!("Re-enter password: ");
         io::stdout().flush()?;
         let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         let trimmed_pass1 = pass1.trim();
         let trimmed_pass2 = pass2.trim();
         if trimmed_pass1 != trimmed_pass2 {
-            println!("Passwords do not match, transaction canceled.");
+            println!("Passwords do not match, operation canceled.");
             return Ok(());
         }
 
@@ -435,7 +483,7 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
                 let mut f = File::create(&backup_path)?;
                 f.write_all(&encrypted)?;
                 fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
-                println!("Encrypted back up completed: {}", backup_path.display());
+                println!("Encrypted backup completed: {}", backup_path.display());
             },
             Err(e) => {
                 println!("Backup encryption failed: {}", e);
@@ -444,8 +492,8 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         }
     } else {
         println!("\n!!! SECURITY WARNING !!!");
-        println!("Please note that this file is unecrypted. Anyone with access to the file can read it. Please be aware of this risk.");
-        print!("To continue, type ‘YES’ in capital letters: ");
+        println!("Please note that this file is UNENCRYPTED. Anyone with access to the file can read it. Please be aware of this risk.");
+        print!("To continue, type 'YES' in capital letters: ");
         io::stdout().flush()?;
         let mut confirmation = String::new();
         io::stdin().read_line(&mut confirmation)?;
@@ -457,7 +505,7 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         
         let mut f = File::create(&backup_path)?;
         f.write_all(plaintext.as_bytes())?;
-        println!("Plain text backup completed: {}", backup_path.display());
+        println!("Plain text backup saved: {}", backup_path.display());
     }
 
     Ok(())
@@ -549,7 +597,7 @@ fn import_from_text(text: &str, store: &mut StoredData) -> usize {
 }
 
 fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
-    print!("Enter the full path of the backup file you want to upload. Example:(/home/user/Desktop/backup.txt or backup.enc): ");
+    print!("Enter the full path of the backup file you want to restore. Example:(/home/user/Desktop/backup.txt or backup.enc): ");
     io::stdout().flush()?;
     let mut path_input = String::new();
     io::stdin().read_line(&mut path_input)?;
@@ -584,7 +632,7 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
         let text = String::from_utf8_lossy(&data);
         import_from_text(&text, store)
     };
-    println!("{} new account loaded", added);
+    println!("{} account(s) imported successfully.", added);
     Ok(())
 }
 
@@ -747,7 +795,6 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
     Ok(())
 }
 
-
 fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
     print!("Account name: ");
     io::stdout().flush()?;
@@ -855,10 +902,35 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     
     store.entries.insert(name.clone(), new_entry);
     encrypt_store(path, password, store)?;
-    println!("'{}' saved.", name);
+    println!("'{}' saved successfully.", name);
     Ok(())
 }
 
+fn settings_menu(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
+    loop {
+        println!("\n=== Settings ===");
+        println!("1) Auto-copy codes to clipboard: {}", 
+                 if store.settings.auto_copy_to_clipboard { "ON" } else { "OFF" });
+        println!("2) Back to main menu");
+        print!("Choice: ");
+        io::stdout().flush()?;
+        
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)?;
+        
+        match choice.trim() {
+            "1" => {
+                store.settings.auto_copy_to_clipboard = !store.settings.auto_copy_to_clipboard;
+                encrypt_store(path, password, store)?;
+                println!("Auto-copy set to: {}", 
+                         if store.settings.auto_copy_to_clipboard { "ON" } else { "OFF" });
+            }
+            "2" => break,
+            _ => println!("Invalid choice."),
+        }
+    }
+    Ok(())
+}
 
 fn main() -> AppResult<()> {
     println!(r" $$\   $$\                  $$$$$$\              $$\     $$\       ");
@@ -922,9 +994,13 @@ fn main() -> AppResult<()> {
         }
     } else {
         println!("\nNo existing store found for this password. A new, encrypted file will be created at '{}' upon saving the first account.", path.display());
-        let mut salt = [0u8; 16];
+        let mut salt = [0u8; SALT_SIZE];
         OsRng.fill_bytes(&mut salt);
-        store = StoredData { entries: HashMap::new(), salt: salt.to_vec() };
+        store = StoredData { 
+            entries: HashMap::new(), 
+            salt: salt.to_vec(),
+            settings: AppSettings::default(),
+        };
     };
 
     loop {
@@ -935,7 +1011,8 @@ fn main() -> AppResult<()> {
         println!("5) List accounts");
         println!("6) Backup codes");
         println!("7) Restore codes");
-        println!("8) Exit");
+        println!("8) Settings");
+        println!("9) Exit");
 
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
@@ -955,6 +1032,14 @@ fn main() -> AppResult<()> {
                     match generate_otp(entry) {
                         Some((code, remaining)) => {
                             println!("\nCode: {}", code);
+                            
+                            if store.settings.auto_copy_to_clipboard {
+                                match copy_to_clipboard(&code) {
+                                    Ok(_) => println!("✓ Code copied to clipboard!"),
+                                    Err(e) => println!("⚠ Could not copy to clipboard: {}", e),
+                                }
+                            }
+                            
                             if entry.otp_type == OtpType::Totp {
                                 println!("Valid for {} more seconds", remaining);
                             } else {
@@ -1027,10 +1112,15 @@ fn main() -> AppResult<()> {
                 }
             }
             "8" => {
+                if let Err(e) = settings_menu(&mut store, &path, &password) {
+                    println!("Settings error: {}", e);
+                }
+            }
+            "9" => {
                 println!("Exiting...");
                 break;
             }
-            _ => println!("Invalid choice.."),
+            _ => println!("Invalid choice."),
         }
     }
 
@@ -1055,6 +1145,7 @@ mod tests {
         assert!(validate_base32("").is_err());
         assert!(validate_base32("123456789").is_err());
     }
+    
     #[test]
     fn test_validate_base32_with_spaces() {
         assert!(validate_base32("JBSW Y3DP EHPK 3PXP").is_ok());
@@ -1135,7 +1226,7 @@ Counter: 5
 
         let mut store = StoredData {
             entries: HashMap::new(),
-            salt: vec![0u8; 16],
+            salt: vec![0u8; SALT_SIZE],
         };
         let added = import_from_text(backup_text, &mut store);
         assert_eq!(added, 2); 
@@ -1167,18 +1258,19 @@ Counter: 5
     fn test_derive_key_performance() {
         use std::time::Instant;        
         let password = "test_password";
-        let salt = [0u8; 16];
+        let salt = [0u8; SALT_SIZE];
         let start = Instant::now();
         let _key = derive_key(password, &salt).unwrap();
         let duration = start.elapsed();
         assert!(duration.as_secs() < 60);
     }
+    
     #[test]
     fn test_encrypt_store_success() {
         let temp_dir = TempDir::new().unwrap();
         let store_path = temp_dir.path().join("test_store.enc");
         let password = "test_password";
-        let mut salt = [0u8; 16];
+        let mut salt = [0u8; SALT_SIZE];
         OsRng.fill_bytes(&mut salt);
         let mut entries = HashMap::new();
         entries.insert(
@@ -1212,7 +1304,7 @@ Counter: 5
         let temp_dir = TempDir::new().unwrap();
         let store_path = temp_dir.path().join("test_store.enc");
         let password = "test_password";
-        let mut salt = [0u8; 16];
+        let mut salt = [0u8; SALT_SIZE];
         OsRng.fill_bytes(&mut salt);
         let store = StoredData {
             entries: HashMap::new(),
@@ -1235,7 +1327,7 @@ Counter: 5
         let temp_dir = TempDir::new().unwrap();
         let store_path = temp_dir.path().join("test_store.enc");
         let password = "test_password";
-        let mut salt = [0u8; 16];
+        let mut salt = [0u8; SALT_SIZE];
         OsRng.fill_bytes(&mut salt);
         let store = StoredData {
             entries: HashMap::new(),
@@ -1265,7 +1357,7 @@ Counter: 5
                 thread::spawn(move || {
                     let store_path = path.join(format!("store_{}.enc", i));
                     let password = format!("password_{}", i);                   
-                    let mut salt = [0u8; 16];
+                    let mut salt = [0u8; SALT_SIZE];
                     OsRng.fill_bytes(&mut salt);                 
                     let store = StoredData {
                         entries: HashMap::new(),
