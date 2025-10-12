@@ -146,6 +146,74 @@ fn store_path_for_password(password: &str) -> AppResult<PathBuf> {
     Ok(data_dir.join(file_name))
 }
 
+fn secure_delete(path: &Path) -> AppResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_size = fs::metadata(path)?.len();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    let mut buffer = vec![0u8; 4096];
+    let mut bytes_written = 0;
+    while bytes_written < file_size {
+        let remaining = file_size - bytes_written;
+        let chunk_size = std::cmp::min(buffer.len() as u64, remaining) as usize;
+        OsRng.fill_bytes(&mut buffer[..chunk_size]);
+        file.write_all(&buffer[..chunk_size])?;
+        bytes_written += chunk_size as u64;
+    }
+    file.sync_data()?;
+    let _ = file.set_len(0);
+    let _ = file.sync_data();
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredData) -> AppResult<Zeroizing<String>> {
+    println!("\n=== Master Password Change ===");
+    print!("Enter NEW password: ");
+    io::stdout().flush()?;
+    let new_pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    print!("Re-enter NEW password: ");
+    io::stdout().flush()?;
+    let new_pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let trimmed_new_pass1 = new_pass1.trim();
+    let trimmed_new_pass2 = new_pass2.trim();
+    if trimmed_new_pass1.is_empty() {
+        return Err(AppError::Cancelled("Password cannot be empty.".to_string()));
+    }
+    if trimmed_new_pass1 != trimmed_new_pass2 {
+        println!("Passwords do not match. Operation cancelled.");
+        return Err(AppError::Cancelled("New passwords do not match.".to_string()));
+    }
+    let old_path = store_path_for_password(old_password)?;
+    let new_path = store_path_for_password(trimmed_new_pass1)?;
+    if new_path.exists() {
+        print!("A store file for the NEW password already exists ({}). Overwrite? (Y/N): ", new_path.display());
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            return Err(AppError::Cancelled("Operation cancelled by user.".to_string()));
+        }
+        let _ = fs::remove_file(&new_path);
+    }
+
+    let mut new_salt = [0u8; SALT_SIZE];
+    OsRng.fill_bytes(&mut new_salt);
+    store.salt = new_salt.to_vec();
+    encrypt_store(&new_path, trimmed_new_pass1, store)?;
+    if old_path.exists() {
+        secure_delete(&old_path)?;
+        println!("\nMaster password changed successfully. Old store file securely deleted.");
+    } else {
+         println!("\nMaster password changed successfully. (No previous file to delete).");
+    }
+    Ok(Zeroizing::new(trimmed_new_pass1.to_string()))
+}
+
 fn any_store_files_exist() -> AppResult<bool> {
     let data_dir = match get_project_dirs() {
         Ok(dir) => dir,
@@ -167,7 +235,6 @@ fn any_store_files_exist() -> AppResult<bool> {
     }
     Ok(false)
 }
-
 fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum::U32>> {
     let params = Params::new(
         ARGON2_MEMORY,
@@ -973,27 +1040,40 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     println!("'{}' saved successfully.", name);
     Ok(())
 }
-
-fn settings_menu(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
+fn settings_menu(store: &mut StoredData, path: &Path, current_password: &mut Zeroizing<String>) -> AppResult<()> {
     loop {
         println!("\n=== Settings ===");
         println!("1) Auto-copy codes to clipboard: {}", 
                  if store.settings.auto_copy_to_clipboard { "ON" } else { "OFF" });
-        println!("2) Back to main menu");
+        println!("2) Change Master Password");
+        println!("3) Back to main menu");
         print!("Choice: ");
         io::stdout().flush()?;
-        
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
-        
         match choice.trim() {
             "1" => {
                 store.settings.auto_copy_to_clipboard = !store.settings.auto_copy_to_clipboard;
-                encrypt_store(path, password, store)?;
+                encrypt_store(path, current_password.as_str(), store)?;
                 println!("Auto-copy set to: {}", 
                          if store.settings.auto_copy_to_clipboard { "ON" } else { "OFF" });
             }
-            "2" => break,
+            "2" => {
+                match change_master_password(current_password, store) {
+                    Ok(new_pass) => {
+                        *current_password = new_pass;
+                        return Err(AppError::Cancelled("Password changed, path update required".to_string()));
+                    }
+                    Err(AppError::Cancelled(msg)) => {
+                        println!("Password change cancelled: {}", msg);
+                    }
+                    Err(e) => {
+                        println!("Password change failed: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            "3" => break,
             _ => println!("Invalid choice."),
         }
     }
@@ -1019,49 +1099,47 @@ fn main() -> AppResult<()> {
     io::stdout().flush()?;
     let mut dummy = String::new();
     io::stdin().read_line(&mut dummy)?;
-
     let any_store = any_store_files_exist()?;
-    let password: Zeroizing<String>;
+    let mut current_password: Zeroizing<String>;
 
     if any_store {
-        print!("Enter your password: ");
-        io::stdout().flush()?;
-        password = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    print!("Enter your password: ");
+    io::stdout().flush()?;
+    current_password = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
     } else {
-        print!("Set a new password: ");
-        io::stdout().flush()?;
-        let first = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-        print!("Re-enter password: ");
-        io::stdout().flush()?;
-        let second = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-        if first.trim() != second.trim() {
-            println!("Passwords do not match. Exiting.");
-            return Ok(());
-        }
-        password = Zeroizing::new(first.trim().to_string());
+    print!("Set a new password: ");
+    io::stdout().flush()?;
+    let first = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    print!("Re-enter password: ");
+    io::stdout().flush()?;
+    let second = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    if first.trim() != second.trim() {
+        println!("Passwords do not match. Exiting.");
+        return Ok(());
     }
-    
-    let path = store_path_for_password(&password)?;
+    current_password = Zeroizing::new(first.trim().to_string());
+}
+    let mut current_path = store_path_for_password(current_password.as_str())?;
     let mut store;
 
-    if path.exists() {
-        match decrypt_store(&path, &password) {
+    if current_path.exists() {
+        match decrypt_store(&current_path, current_password.as_str()) {
             Ok(data) => {
-                println!("\nStore loaded successfully: {}", path.display());
+                println!("\nStore loaded successfully: {}", current_path.display());
                 store = data;
             },
             Err(AppError::Crypto | AppError::Argon2Hash(_) | AppError::InvalidData(_)) => {
-                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", path.display());
+                eprintln!("\nError: Could not decrypt store file '{}'. The password is incorrect or the file is corrupted.", current_path.display());
                 eprintln!("A store file exists for this password, but could not be accessed. Exiting.");
                 return Err(AppError::InvalidData("Password decryption or file corruption".to_string()));
             }
             Err(e) => {
-                eprintln!("\nCritical error accessing store file '{}': {}", path.display(), e);
+                eprintln!("\nCritical error accessing store file '{}': {}", current_path.display(), e);
                 return Err(e);
             }
         }
     } else {
-        println!("\nNo existing store found for this password. A new, encrypted file will be created at '{}' upon saving the first account.", path.display());
+        println!("\nNo existing store found for this password. A new, encrypted file will be created at '{}' upon saving the first account.", current_path.display());
         let mut salt = [0u8; SALT_SIZE];
         OsRng.fill_bytes(&mut salt);
         store = StoredData { 
@@ -1070,7 +1148,6 @@ fn main() -> AppResult<()> {
             settings: AppSettings::default(),
         };
     };
-
     loop {
         println!("\n1) Add account");
         println!("2) Get code");
@@ -1086,8 +1163,8 @@ fn main() -> AppResult<()> {
         io::stdin().read_line(&mut choice)?;
         match choice.trim() {
             "1" => {
-                if let Err(e) = add_account_interactive(&mut store, &path, &password) {
-                     println!("Add account error: {}", e);
+                if let Err(e) = add_account_interactive(&mut store, &current_path, current_password.as_str()) {
+                     eprintln!("Error adding account: {}", e);
                 }
             }
             "2" => {
@@ -1103,8 +1180,8 @@ fn main() -> AppResult<()> {
                             
                             if store.settings.auto_copy_to_clipboard {
                                 match copy_to_clipboard(&code) {
-                                    Ok(_) => println!("✓ Code copied to clipboard!"),
-                                    Err(e) => println!("⚠ Could not copy to clipboard: {}", e),
+                                    Ok(_) => println!("Code copied to clipboard!"),
+                                    Err(e) => println!("Could not copy to clipboard: {}", e),
                                 }
                             }
                             
@@ -1114,7 +1191,7 @@ fn main() -> AppResult<()> {
                                 if let Some(mut_entry) = store.entries.get_mut(name) {
                                     mut_entry.counter += 1;
                                     println!("HOTP counter incremented to {}", mut_entry.counter);
-                                    if let Err(e) = encrypt_store(&path, &password, &store) {
+                                    if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
                                         println!("Warning: Could not save updated counter: {}", e);
                                     }
                                 }
@@ -1130,8 +1207,8 @@ fn main() -> AppResult<()> {
                 }
             }
             "3" => {
-                if let Err(e) = edit_account(&mut store, &path, &password) {
-                    println!("Edit error: {}", e);
+                if let Err(e) = edit_account(&mut store, &current_path, current_password.as_str()) {
+                    eprintln!("Error saving store: {}", e);
                 }
             }
             "4" => {
@@ -1141,7 +1218,7 @@ fn main() -> AppResult<()> {
                 io::stdin().read_line(&mut name)?;
                 let name = name.trim();
                 if store.entries.remove(name).is_some() {
-                    if let Err(e) = encrypt_store(&path, &password, &store) {
+                    if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
                         println!("Warning: Could not save store after deletion: {}", e);
                     } else {
                         println!("Account '{}' deleted.", name);
@@ -1175,15 +1252,29 @@ fn main() -> AppResult<()> {
                     println!("Restore error: {}", e);
                 } else {
                     if store.entries.len() > 0 {
-                       if let Err(e) = encrypt_store(&path, &password, &store) {
+                       if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
                            println!("Warning: Could not save store after successful restore: {}", e);
                        }
                     }
                 }
             }
             "8" => {
-                if let Err(e) = settings_menu(&mut store, &path, &password) {
-                    println!("Settings error: {}", e);
+                match settings_menu(&mut store, &current_path, &mut current_password) {
+                    Ok(_) => {
+                        current_path = store_path_for_password(current_password.as_str())?;
+                    }
+                    Err(AppError::Cancelled(msg)) => {
+                        if msg.contains("Password changed") {
+                            current_path = store_path_for_password(current_password.as_str())?;
+                            println!("New store path is: {}", current_path.display());
+                        } else {
+                            println!("Operation cancelled: {}", msg);
+                        }
+                    }
+                    Err(e) => {
+                        println!("Settings error: {}", e);
+                        return Err(e);
+                    }
                 }
             }
             "9" => {
@@ -1438,7 +1529,7 @@ Counter: 5
                         salt: salt.to_vec(),
                         settings: AppSettings::default(),
                     };                   
-                    encrypt_store(&store_path, &password, &store).unwrap();
+                    encrypt_store(&store_path, &current_password, &store).unwrap();
                     
                     let tmp_path = store_path.with_extension("tmp");
                     assert!(!tmp_path.exists());
