@@ -121,7 +121,7 @@ struct StoredData {
 
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
-const ARGON2_PARALLELISM: u32 = 4; 
+const ARGON2_PARALLELISM: u32 = 1; 
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn get_project_dirs() -> AppResult<PathBuf> {
@@ -312,12 +312,13 @@ fn get_remaining_seconds(step: u64) -> u64 {
     step - ((Utc::now().timestamp() % step as i64) as u64)
 }
 
-fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<String> {
+fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<Zeroizing<String>> {
     let cleaned = secret_b32.replace(" ", "").to_uppercase();
     let secret_bytes = decode(Alphabet::Rfc4648 { padding: false }, &cleaned)?;
     let secret = Zeroizing::new(secret_bytes);
     let counter_bytes = counter.to_be_bytes();
-    let result = match algorithm {
+
+    let result = Zeroizing::new(match algorithm {
         OtpAlgorithm::Sha1 => {
             let mut mac = <HmacSha1 as HmacKeyInit>::new_from_slice(&*secret).ok()?;
             mac.update(&counter_bytes);
@@ -333,7 +334,7 @@ fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlg
             mac.update(&counter_bytes);
             mac.finalize().into_bytes().to_vec()
         }
-    };
+    });
 
     let offset = (result[result.len() - 1] & 0x0f) as usize;
     let code = ((u32::from(result[offset]) & 0x7f) << 24)
@@ -347,10 +348,10 @@ fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlg
         _ => return None,
     };
 
-    Some(format!("{:0width$}", code % divisor, width = digits as usize))
+    Some(Zeroizing::new(format!("{:0width$}", code % divisor, width = digits as usize)))
 }
 
-fn generate_otp(entry: &OtpEntry) -> Option<(String, u64)> {
+fn generate_otp(entry: &OtpEntry) -> Option<(Zeroizing<String>, u64)> {
     match entry.otp_type {
         OtpType::Totp => {
             let timestep = (Utc::now().timestamp() / entry.step as i64) as u64;
@@ -494,9 +495,9 @@ fn get_backup_path_interactive(is_encrypted: bool) -> AppResult<PathBuf> {
     Ok(full_path)
 }
 
-fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> String {
-    let mut s = format!("Account: {}\nSecret: {}\nType: {:?}\nAlgorithm: {:?}\nDigits: {}\n", 
-                        name, entry.secret.as_str(), entry.otp_type, entry.algorithm, entry.digits);
+fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> Zeroizing<String> {
+    let mut s = Zeroizing::new(format!("Account: {}\nSecret: {}\nType: {:?}\nAlgorithm: {:?}\nDigits: {}\n",
+                        name, entry.secret.as_str(), entry.otp_type, entry.algorithm, entry.digits));
     match entry.otp_type {
         OtpType::Totp => s.push_str(&format!("Step: {}\n", entry.step)),
         OtpType::Hotp => s.push_str(&format!("Counter: {}\n", entry.counter)),
@@ -524,7 +525,7 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         Err(AppError::Cancelled(_)) => return Ok(()),
         Err(e) => return Err(e),
     };
-
+    
     let mut plaintext = Zeroizing::new(String::new());
     for (name, entry) in &store.entries {
         plaintext.push_str(&otp_entry_to_string(name, entry));
@@ -1098,7 +1099,7 @@ fn main() -> AppResult<()> {
                 if let Some(entry) = store.entries.get(name) {
                     match generate_otp(entry) {
                         Some((code, remaining)) => {
-                            println!("\nCode: {}", code);
+                            println!("\nCode: {}", code.as_str());
                             
                             if store.settings.auto_copy_to_clipboard {
                                 match copy_to_clipboard(&code) {
