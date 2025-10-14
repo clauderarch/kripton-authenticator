@@ -172,17 +172,21 @@ fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredDa
     print!("Re-enter NEW password: ");
     io::stdout().flush()?;
     let new_pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-    let trimmed_new_pass1 = new_pass1.trim();
-    let trimmed_new_pass2 = new_pass2.trim();
-    if trimmed_new_pass1.is_empty() {
+    
+    let trimmed_new_pass1 = Zeroizing::new(new_pass1.trim().to_string());
+    let trimmed_new_pass2 = Zeroizing::new(new_pass2.trim().to_string());
+    
+    if trimmed_new_pass1.as_str().is_empty() {
         return Err(AppError::Cancelled("Password cannot be empty.".to_string()));
     }
-    if trimmed_new_pass1 != trimmed_new_pass2 {
+    if trimmed_new_pass1.as_str() != trimmed_new_pass2.as_str() {
         println!("Passwords do not match. Operation cancelled.");
         return Err(AppError::Cancelled("New passwords do not match.".to_string()));
     }
+    
     let old_path = store_path_for_password(old_password)?;
-    let new_path = store_path_for_password(trimmed_new_pass1)?;
+    let new_path = store_path_for_password(&trimmed_new_pass1)?;
+    
     if new_path.exists() {
         print!("A store file for the NEW password already exists ({}). Overwrite? (Y/N): ", new_path.display());
         io::stdout().flush()?;
@@ -197,14 +201,16 @@ fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredDa
     let mut new_salt = [0u8; SALT_SIZE];
     OsRng.fill_bytes(&mut new_salt);
     store.salt = new_salt.to_vec();
-    encrypt_store(&new_path, trimmed_new_pass1, store)?;
+    encrypt_store(&new_path, &trimmed_new_pass1, store)?;
+    
     if old_path.exists() {
         secure_delete(&old_path)?;
         println!("\nMaster password changed successfully. Old store file securely deleted.");
     } else {
-         println!("\nMaster password changed successfully. (No previous file to delete).");
+        println!("\nMaster password changed successfully. (No previous file to delete).");
     }
-    Ok(Zeroizing::new(trimmed_new_pass1.to_string()))
+    
+    Ok(trimmed_new_pass1)
 }
 
 fn parse_otpauth_uri(uri_str: &str) -> Result<(String, OtpEntry), String> {
@@ -233,7 +239,12 @@ fn parse_otpauth_uri(uri_str: &str) -> Result<(String, OtpEntry), String> {
 
     let params: HashMap<String, String> = uri.query_pairs().into_owned().collect();
 
-    let secret = params.get("secret").ok_or("Secret parameter is missing")?.to_string();
+    let secret = Zeroizing::new(
+        params.get("secret")
+            .ok_or("Secret parameter is missing")?
+            .to_string()
+    );
+    
     if validate_base32(&secret).is_err() {
         return Err("Invalid Base32 secret".to_string());
     }
@@ -258,7 +269,7 @@ fn parse_otpauth_uri(uri_str: &str) -> Result<(String, OtpEntry), String> {
     };
 
     let mut entry = OtpEntry {
-        secret: Zeroizing::new(secret),
+        secret,
         otp_type,
         algorithm,
         digits,
@@ -446,7 +457,7 @@ fn get_remaining_seconds(step: u64) -> u64 {
 }
 
 fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<Zeroizing<String>> {
-    let cleaned = secret_b32.replace(" ", "").to_uppercase();
+    let cleaned = Zeroizing::new(secret_b32.replace(" ", "").to_uppercase());
     let secret_bytes = decode(Alphabet::Rfc4648 { padding: false }, &cleaned)?;
     let secret = Zeroizing::new(secret_bytes);
     let counter_bytes = counter.to_be_bytes();
@@ -722,14 +733,14 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         print!("Re-enter password: ");
         io::stdout().flush()?;
         let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-        let trimmed_pass1 = pass1.trim();
-        let trimmed_pass2 = pass2.trim();
+        let trimmed_pass1 = Zeroizing::new(pass1.trim().to_string());
+        let trimmed_pass2 = Zeroizing::new(pass2.trim().to_string());
         if trimmed_pass1 != trimmed_pass2 {
             println!("Passwords do not match, operation canceled.");
             return Ok(());
         }
 
-        match encrypt_data(plaintext.as_bytes(), trimmed_pass1) {
+        match encrypt_data(plaintext.as_bytes(), &trimmed_pass1) {
             Ok(encrypted) => {
                 let mut f = File::create(&backup_path)?;
                 f.write_all(&encrypted)?;
@@ -872,7 +883,8 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
         let pass = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-        match decrypt_data(&data, pass.trim()) {
+        let trimmed_pass = Zeroizing::new(pass.trim().to_string());
+        match decrypt_data(&data, &trimmed_pass) {
             Ok(plaintext) => {
                 let text = String::from_utf8_lossy(&*plaintext);
                 if text.trim().starts_with("otpauth://") {
@@ -1258,22 +1270,24 @@ fn main() -> AppResult<()> {
     let any_store = any_store_files_exist()?;
     let mut current_password: Zeroizing<String>;
 
-    if any_store {
+if any_store {
     print!("Enter your password: ");
     io::stdout().flush()?;
     current_password = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-    } else {
+} else {
     print!("Set a new password: ");
     io::stdout().flush()?;
     let first = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
     print!("Re-enter password: ");
     io::stdout().flush()?;
     let second = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-    if first.trim() != second.trim() {
+    let trimmed_first = Zeroizing::new(first.trim().to_string());
+    let trimmed_second = Zeroizing::new(second.trim().to_string());
+    if trimmed_first.as_str() != trimmed_second.as_str() {
         println!("Passwords do not match. Exiting.");
         return Ok(());
     }
-    current_password = Zeroizing::new(first.trim().to_string());
+    current_password = trimmed_first;
 }
     let mut current_path = store_path_for_password(current_password.as_str())?;
     let mut store;
@@ -1692,7 +1706,7 @@ Counter: 5
                         salt: salt.to_vec(),
                         settings: AppSettings::default(),
                     };                   
-                    encrypt_store(&store_path, &current_password, &store).unwrap();
+                    encrypt_store(&store_path, &password, &store).unwrap();
                     
                     let tmp_path = store_path.with_extension("tmp");
                     assert!(!tmp_path.exists());
