@@ -22,6 +22,9 @@ use directories::ProjectDirs;
 use zeroize::Zeroizing;
 use thiserror::Error; 
 use typenum::{U12};
+use url::Url;
+use urlencoding::decode as url_decode;
+use urlencoding::encode;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -202,6 +205,81 @@ fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredDa
          println!("\nMaster password changed successfully. (No previous file to delete).");
     }
     Ok(Zeroizing::new(trimmed_new_pass1.to_string()))
+}
+
+fn parse_otpauth_uri(uri_str: &str) -> Result<(String, OtpEntry), String> {
+    let uri = Url::parse(uri_str).map_err(|e| format!("Invalid URI format: {}", e))?;
+
+    if uri.scheme() != "otpauth" {
+        return Err("Not an otpauth URI".to_string());
+    }
+
+    let otp_type = match uri.host_str() {
+        Some("totp") => OtpType::Totp,
+        Some("hotp") => OtpType::Hotp,
+        _ => return Err("Invalid or missing OTP type (totp/hotp)".to_string()),
+    };
+
+    let path = uri.path().trim_start_matches('/');
+    let (issuer_from_label, name_from_label) = if let Some(colon_pos) = path.find(':') {
+        let (issuer, name) = path.split_at(colon_pos);
+        (
+            Some(url_decode(issuer).map_err(|e| e.to_string())?.into_owned()),
+            url_decode(&name[1..]).map_err(|e| e.to_string())?.into_owned()
+        )
+    } else {
+        (None, url_decode(path).map_err(|e| e.to_string())?.into_owned())
+    };
+
+    let params: HashMap<String, String> = uri.query_pairs().into_owned().collect();
+
+    let secret = params.get("secret").ok_or("Secret parameter is missing")?.to_string();
+    if validate_base32(&secret).is_err() {
+        return Err("Invalid Base32 secret".to_string());
+    }
+
+    let final_name = if let Some(issuer_param) = params.get("issuer") {
+        format!("{}:{}", issuer_param, name_from_label)
+    } else if let Some(issuer) = issuer_from_label {
+        format!("{}:{}", issuer, name_from_label)
+    } else {
+        name_from_label
+    };
+    
+    let algorithm = match params.get("algorithm").map(|s| s.to_uppercase()).as_deref() {
+        Some("SHA256") => OtpAlgorithm::Sha256,
+        Some("SHA512") => OtpAlgorithm::Sha512,
+        _ => OtpAlgorithm::Sha1,
+    };
+    
+    let digits = match params.get("digits").and_then(|s| s.parse::<u8>().ok()) {
+        Some(8) => 8,
+        _ => 6,
+    };
+
+    let mut entry = OtpEntry {
+        secret: Zeroizing::new(secret),
+        otp_type,
+        algorithm,
+        digits,
+        step: 0,
+        counter: 0,
+    };
+
+    match otp_type {
+        OtpType::Totp => {
+            entry.step = match params.get("period").and_then(|s| s.parse::<u64>().ok()) {
+                Some(p) if p > 0 => p,
+                _ => 30,
+            };
+        }
+        OtpType::Hotp => {
+            entry.counter = params.get("counter").and_then(|s| s.parse::<u64>().ok())
+                .ok_or("HOTP entry is missing counter parameter")?;
+        }
+    }
+
+    Ok((final_name, entry))
 }
 
 fn any_store_files_exist() -> AppResult<bool> {
@@ -561,20 +639,64 @@ fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> Zeroizing<String> {
     s
 }
 
+fn otp_entry_to_uri(name: &str, entry: &OtpEntry) -> Zeroizing<String> {
+    let type_str = match entry.otp_type {
+        OtpType::Totp => "totp",
+        OtpType::Hotp => "hotp",
+    };
+    let label = encode(name);
+    let mut uri = Zeroizing::new(format!(
+        "otpauth://{}/{}?secret={}&digits={}",
+        type_str,
+        label,
+        entry.secret.as_str().replace(" ", ""),
+        entry.digits
+    ));
+
+    let algo_str = match entry.algorithm {
+        OtpAlgorithm::Sha1 => "SHA1",
+        OtpAlgorithm::Sha256 => "SHA256",
+        OtpAlgorithm::Sha512 => "SHA512",
+    };
+    uri.push_str(&format!("&algorithm={}", algo_str));
+
+    match entry.otp_type {
+        OtpType::Totp => {
+            uri.push_str(&format!("&period={}", entry.step));
+        }
+        OtpType::Hotp => {
+            uri.push_str(&format!("&counter={}", entry.counter));
+        }
+    }
+    
+    uri
+}
 fn backup_codes(store: &StoredData) -> AppResult<()> {
     if store.entries.is_empty() {
         println!("No accounts registered yet.");
         return Ok(());
     }
 
+    println!("\nSelect Backup Format:");
     println!("1) Plain text backup (.txt)");
-    println!("2) Encrypted backup (.enc)");
+    println!("2) Encrypted plain text backup (.enc)");
+    println!("3) otpauth:// URI list for QR code generation (.txt)");
     print!("Your choice: ");
     io::stdout().flush()?;
+
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
     let choice = choice.trim();
-    let is_enc = choice == "2";
+    let (is_enc, is_uri) = match choice {
+        "1" => (false, false),
+        "2" => (true, false),
+        "3" => (false, true),
+        _ => {
+            println!("Invalid choice. Operation cancelled.");
+            return Ok(());
+        }
+    };
+
     let backup_path = match get_backup_path_interactive(is_enc) {
         Ok(p) => p,
         Err(AppError::Cancelled(_)) => return Ok(()),
@@ -582,8 +704,15 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
     };
     
     let mut plaintext = Zeroizing::new(String::new());
-    for (name, entry) in &store.entries {
-        plaintext.push_str(&otp_entry_to_string(name, entry));
+    if is_uri {
+        for (name, entry) in &store.entries {
+            plaintext.push_str(&otp_entry_to_uri(name, entry));
+            plaintext.push('\n');
+        }
+    } else {
+        for (name, entry) in &store.entries {
+            plaintext.push_str(&otp_entry_to_string(name, entry));
+        }
     }
 
     if is_enc {
@@ -614,20 +743,25 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         }
     } else {
         println!("\n!!! SECURITY WARNING !!!");
-        println!("Please note that this file is UNENCRYPTED. Anyone with access to the file can read it. Please be aware of this risk.");
+        if is_uri {
+            println!("This file will contain otpauth:// URIs including your secrets in PLAIN TEXT.");
+            println!("Anyone who gets this file can access your accounts. Protect it carefully.");
+        } else {
+            println!("Please note that this file is UNENCRYPTED. Anyone with access to the file can read it.");
+        }
         print!("To continue, type 'YES' in capital letters: ");
         io::stdout().flush()?;
         let mut confirmation = String::new();
         io::stdin().read_line(&mut confirmation)?;
-        
+    
         if confirmation.trim() != "YES" {
-            println!("Plain text backup cancelled by user.");
+            println!("Backup cancelled by user.");
             return Ok(());
         }
         
         let mut f = File::create(&backup_path)?;
         f.write_all(plaintext.as_bytes())?;
-        println!("Plain text backup saved: {}", backup_path.display());
+        println!("Backup saved: {}", backup_path.display());
     }
 
     Ok(())
@@ -725,6 +859,7 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
     io::stdin().read_line(&mut path_input)?;
     let path_input = path_input.trim();
     let backup_path = Path::new(path_input);
+
     if !backup_path.exists() {
         println!("The specified file does not exist.");
         return Ok(());
@@ -732,6 +867,7 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
 
     let mut data = Vec::new();
     File::open(backup_path)?.read_to_end(&mut data)?;
+    
     let added = if backup_path.extension().and_then(|s| s.to_str()) == Some("enc") {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
@@ -739,23 +875,55 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
         match decrypt_data(&data, pass.trim()) {
             Ok(plaintext) => {
                 let text = String::from_utf8_lossy(&*plaintext);
-                let count = import_from_text(&text, store);
-                count
+                if text.trim().starts_with("otpauth://") {
+                    import_from_uri_list(&text, store)
+                } else {
+                    import_from_text(&text, store)
+                }
             }
             Err(AppError::Crypto | AppError::Argon2Hash(_) | AppError::Argon2(_) | AppError::Argon2Params(_) | AppError::InvalidData(_)) => {
                 println!("The password is incorrect or the file is corrupted.");
                 return Ok(());
             }
-            Err(e) => {
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     } else {
         let text = String::from_utf8_lossy(&data);
-        import_from_text(&text, store)
+        if text.trim().starts_with("otpauth://") {
+            println!("otpauth:// URI list detected. Importing...");
+            import_from_uri_list(&text, store)
+        } else {
+            println!("Custom plain text format detected. Importing...");
+            import_from_text(&text, store)
+        }
     };
+
     println!("{} account(s) imported successfully.", added);
     Ok(())
+}
+
+fn import_from_uri_list(text: &str, store: &mut StoredData) -> usize {
+    let mut added = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_otpauth_uri(line) {
+            Ok((name, entry)) => {
+                if !store.entries.contains_key(&name) {
+                    store.entries.insert(name.clone(), entry);
+                    println!("- Imported '{}'", name);
+                    added += 1;
+                } else {
+                    println!("- Skipped '{}' (already exists).", name);
+                }
+            }
+            Err(e) => {
+                println!("- Warning: Could not parse a line: '{}'. Error: {}", line, e);
+            }
+        }
+    }
+    added
 }
 
 fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
