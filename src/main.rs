@@ -1344,14 +1344,21 @@ fn main() -> AppResult<()> {
                             if entry.otp_type == OtpType::Totp {
                                 println!("Valid for {} more seconds", remaining);
                             } else {
-                                if let Some(mut_entry) = store.entries.get_mut(name) {
-                                    mut_entry.counter += 1;
-                                    println!("HOTP counter incremented to {}", mut_entry.counter);
-                                    if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
-                                        println!("Warning: Could not save updated counter: {}", e);
-                                    }
-                                }
-                            }
+                            print!("Did you SUCCESSFULLY use this HOTP code? (Y/N): ");
+                            io::stdout().flush()?;
+                            let mut answer = String::new();
+                            io::stdin().read_line(&mut answer)?;
+    
+                            if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+                            if let Some(mut_entry) = store.entries.get_mut(name) {
+                            mut_entry.counter += 1;
+                            println!("The HOTP counter has been updated to {}.", mut_entry.counter);
+                            if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
+                            println!("Warning: Updated counter could not be saved: {}", e);
+                  }
+               }
+          } else {println!("The counter has NOT been increased. The generated code is now invalid. You must use this code and confirm it to try again.");}
+       }
                         }
                         None => {
                             println!("Failed to generate code. Check algorithm or secret.");
