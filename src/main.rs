@@ -3,13 +3,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-};
-
+    path::{Path, PathBuf},};
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, generic_array::GenericArray, rand_core::RngCore},
-    Aes256Gcm, Nonce,
-};
+    Aes256Gcm, Nonce,};
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
 use arboard::SetExtLinux;
@@ -24,7 +21,7 @@ use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
 use zeroize::Zeroizing;
 use thiserror::Error; 
-use typenum::{U12, U32};
+use typenum::{U12};
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -47,40 +44,33 @@ enum AppError {
     #[error("Clipboard error: {0}")]
     Clipboard(String),
 }
-
 impl From<argon2::password_hash::Error> for AppError {
     fn from(err: argon2::password_hash::Error) -> Self {
         AppError::Argon2Hash(err.to_string())
     }
 }
-
 impl From<argon2::Error> for AppError {
     fn from(err: argon2::Error) -> Self {
         AppError::Argon2(err.to_string())
     }
 }
-
 impl From<arboard::Error> for AppError {
     fn from(err: arboard::Error) -> Self {
         AppError::Clipboard(err.to_string())
     }
 }
-
 type AppResult<T> = Result<T, AppError>;
 type HmacSha1 = Hmac<sha1::Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
-
 const NONCE_SIZE: usize = 12;
 const SALT_SIZE: usize = 16;
 const KEY_SIZE: usize = 32;
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 enum OtpType {
     Totp,
     Hotp,
 }
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 enum OtpAlgorithm {
     Sha1,
@@ -235,7 +225,7 @@ fn any_store_files_exist() -> AppResult<bool> {
     }
     Ok(false)
 }
-fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum::U32>> {
+fn derive_key(password: &str, salt: &[u8]) -> AppResult<Zeroizing<[u8; KEY_SIZE]>> {
     let params = Params::new(
         ARGON2_MEMORY,
         ARGON2_TIME,
@@ -248,25 +238,23 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<GenericArray<u8, typenum
         Version::V0x13,
         params,
     );
-
-    let mut key = Zeroizing::new([0u8; KEY_SIZE]);
+    let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
     argon2.hash_password_into(
         password.as_bytes(),
         salt,
-        &mut *key
+        &mut *key_bytes
     )?;
-
-    Ok(GenericArray::clone_from_slice(&*key))
+    Ok(key_bytes)
 }
 
-fn core_encrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, data: &[u8]) -> AppResult<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key);
+fn core_encrypt(key: &Zeroizing<[u8; KEY_SIZE]>, nonce: &Nonce<U12>, data: &[u8]) -> AppResult<Vec<u8>> {	
+    let cipher = Aes256Gcm::new(&GenericArray::from(**key));
     cipher.encrypt(nonce, data)
         .map_err(|_| AppError::Crypto)
 }
 
-fn core_decrypt(key: &GenericArray<u8, U32>, nonce: &Nonce<U12>, ciphertext: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
-    let cipher = Aes256Gcm::new(key);
+fn core_decrypt(key: &Zeroizing<[u8; KEY_SIZE]>, nonce: &Nonce<U12>, ciphertext: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
+    let cipher = Aes256Gcm::new(&GenericArray::from(**key));
     let plaintext = cipher.decrypt(nonce, ciphertext)
         .map_err(|_| AppError::Crypto)?;
     Ok(Zeroizing::new(plaintext))
