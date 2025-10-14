@@ -114,7 +114,7 @@ struct StoredData {
 
 const ARGON2_TIME: u32 = 3;       
 const ARGON2_MEMORY: u32 = 131072;
-const ARGON2_PARALLELISM: u32 = 1; 
+const ARGON2_PARALLELISM: u32 = 4; 
 const STORE_FILE_BASE: &str = "auth_store";
 
 fn get_project_dirs() -> AppResult<PathBuf> {
