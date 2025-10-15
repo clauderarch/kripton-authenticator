@@ -19,7 +19,7 @@ use rpassword::read_password;
 use sha2::{Digest, Sha256, Sha512};
 use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
-use zeroize::Zeroizing;
+use zeroize::{Zeroizing, Zeroize};
 use thiserror::Error; 
 use typenum::{U12};
 use url::Url;
@@ -93,15 +93,15 @@ struct OtpEntry {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AppSettings {
-    auto_copy_to_clipboard: bool,
     #[serde(default)]
+    auto_copy_to_clipboard: bool,
     hide_otp_codes: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
-            auto_copy_to_clipboard: true,
+            auto_copy_to_clipboard: false,
             hide_otp_codes: false,
         }
     }
@@ -171,15 +171,19 @@ fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredDa
     println!("\n=== Master Password Change ===");
     print!("Enter NEW password: ");
     io::stdout().flush()?;
-    let new_pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let mut new_pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
     print!("Re-enter NEW password: ");
     io::stdout().flush()?;
-    let new_pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let mut new_pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
     
-    let trimmed_new_pass1 = Zeroizing::new(new_pass1.trim().to_string());
-    drop(new_pass1);
-    let trimmed_new_pass2 = Zeroizing::new(new_pass2.trim().to_string());
-    drop(new_pass2);
+    let trimmed_new_pass1 = Zeroizing::new({
+    let temp = new_pass1.trim().to_string();
+    new_pass1.zeroize();
+    temp});
+    let trimmed_new_pass2 = Zeroizing::new({
+    let temp = new_pass2.trim().to_string();
+    new_pass2.zeroize();
+    temp});
     if trimmed_new_pass1.as_str().is_empty() {
         return Err(AppError::Cancelled("Password cannot be empty.".to_string()));
     }
@@ -384,8 +388,9 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = serde_json::to_vec(data)?;
-    let ciphertext = core_encrypt(&key, nonce, plaintext.as_ref())?; 
+    let mut plaintext = serde_json::to_vec(data)?;
+    let ciphertext = core_encrypt(&key, nonce, &plaintext)?;
+    plaintext.zeroize();
     let mut file_data = Vec::new();
     file_data.extend_from_slice(&nonce_bytes);
     file_data.extend_from_slice(&data.salt);
@@ -1288,7 +1293,11 @@ fn main() -> AppResult<()> {
 if any_store {
     print!("Enter your password: ");
     io::stdout().flush()?;
-    current_password = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    current_password = Zeroizing::new({
+    let mut pass = read_password().map_err(|e| AppError::Io(e))?;
+    let result = pass.clone();
+    pass.zeroize();
+    result});
 } else {
     print!("Set a new password: ");
     io::stdout().flush()?;
