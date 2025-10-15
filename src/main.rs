@@ -177,8 +177,9 @@ fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredDa
     let new_pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
     
     let trimmed_new_pass1 = Zeroizing::new(new_pass1.trim().to_string());
+    drop(new_pass1);
     let trimmed_new_pass2 = Zeroizing::new(new_pass2.trim().to_string());
-    
+    drop(new_pass2);
     if trimmed_new_pass1.as_str().is_empty() {
         return Err(AppError::Cancelled("Password cannot be empty.".to_string()));
     }
@@ -737,7 +738,9 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         io::stdout().flush()?;
         let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         let trimmed_pass1 = Zeroizing::new(pass1.trim().to_string());
+        drop(pass1);
         let trimmed_pass2 = Zeroizing::new(pass2.trim().to_string());
+        drop(pass2);
         if trimmed_pass1 != trimmed_pass2 {
             println!("Passwords do not match, operation canceled.");
             return Ok(());
@@ -885,8 +888,9 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
     let added = if backup_path.extension().and_then(|s| s.to_str()) == Some("enc") {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
+        let trimmed_pass = Zeroizing::new({
         let pass = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
-        let trimmed_pass = Zeroizing::new(pass.trim().to_string());
+        pass.trim().to_string()});
         match decrypt_data(&data, &trimmed_pass) {
             Ok(plaintext) => {
                 let text = String::from_utf8_lossy(&*plaintext);
@@ -1298,6 +1302,7 @@ if any_store {
         println!("Passwords do not match. Exiting.");
         return Ok(());
     }
+    drop(trimmed_second);
     current_password = trimmed_first;
 }
     let mut current_path = store_path_for_password(current_password.as_str())?;
