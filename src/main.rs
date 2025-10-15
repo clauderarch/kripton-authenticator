@@ -94,12 +94,15 @@ struct OtpEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct AppSettings {
     auto_copy_to_clipboard: bool,
+    #[serde(default)]
+    hide_otp_codes: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             auto_copy_to_clipboard: true,
+            hide_otp_codes: false,
         }
     }
 }
@@ -1213,8 +1216,10 @@ fn settings_menu(store: &mut StoredData, path: &Path, current_password: &mut Zer
         println!("\n=== Settings ===");
         println!("1) Auto-copy codes to clipboard: {}", 
                  if store.settings.auto_copy_to_clipboard { "ON" } else { "OFF" });
-        println!("2) Change Master Password");
-        println!("3) Back to main menu");
+        println!("2) Hide OTP codes by default: {}",
+                 if store.settings.hide_otp_codes { "ON" } else { "OFF" });
+        println!("3) Change Master Password");
+        println!("4) Back to main menu");
         print!("Choice: ");
         io::stdout().flush()?;
         let mut choice = String::new();
@@ -1227,6 +1232,12 @@ fn settings_menu(store: &mut StoredData, path: &Path, current_password: &mut Zer
                          if store.settings.auto_copy_to_clipboard { "ON" } else { "OFF" });
             }
             "2" => {
+                store.settings.hide_otp_codes = !store.settings.hide_otp_codes;
+                encrypt_store(path, current_password.as_str(), store)?;
+                println!("Hide OTP codes set to: {}",
+                         if store.settings.hide_otp_codes { "ON" } else { "OFF" });
+            }
+            "3" => {
                 match change_master_password(current_password, store) {
                     Ok(new_pass) => {
                         *current_password = new_pass;
@@ -1241,7 +1252,7 @@ fn settings_menu(store: &mut StoredData, path: &Path, current_password: &mut Zer
                     }
                 }
             }
-            "3" => break,
+            "4" => break,
             _ => println!("Invalid choice."),
         }
     }
@@ -1346,33 +1357,50 @@ if any_store {
                 if let Some(entry) = store.entries.get(name) {
                     match generate_otp(entry) {
                         Some((code, remaining)) => {
-                            println!("\nCode: {}", code.as_str());
-                            
-                            if store.settings.auto_copy_to_clipboard {
-                                match copy_to_clipboard(&code) {
-                                    Ok(_) => println!("Code copied to clipboard!"),
-                                    Err(e) => println!("Could not copy to clipboard: {}", e),
+                            if store.settings.hide_otp_codes {
+                                let hidden_code = "*".repeat(code.len());
+                                println!("\nCode: {}", hidden_code);
+
+                                if store.settings.auto_copy_to_clipboard {
+                                    match copy_to_clipboard(&code) {
+                                        Ok(_) => println!("Code copied to clipboard!"),
+                                        Err(e) => println!("Could not copy to clipboard: {}", e),
+                                    }
+                                }
+
+                                if entry.otp_type == OtpType::Totp {
+                                    println!("Valid for {} more seconds", remaining);
+                                }
+                            } else {
+                                println!("\nCode: {}", code.as_str());
+                                if store.settings.auto_copy_to_clipboard {
+                                    match copy_to_clipboard(&code) {
+                                        Ok(_) => println!("Code copied to clipboard!"),
+                                        Err(e) => println!("Could not copy to clipboard: {}", e),
+                                    }
+                                }
+                                if entry.otp_type == OtpType::Totp {
+                                    println!("Valid for {} more seconds", remaining);
                                 }
                             }
-                            
-                            if entry.otp_type == OtpType::Totp {
-                                println!("Valid for {} more seconds", remaining);
-                            } else {
-                            print!("Did you SUCCESSFULLY use this HOTP code? (Y/N): ");
-                            io::stdout().flush()?;
-                            let mut answer = String::new();
-                            io::stdin().read_line(&mut answer)?;
-    
-                            if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-                            if let Some(mut_entry) = store.entries.get_mut(name) {
-                            mut_entry.counter += 1;
-                            println!("The HOTP counter has been updated to {}.", mut_entry.counter);
-                            if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
-                            println!("Warning: Updated counter could not be saved: {}", e);
-                  }
-               }
-          } else {println!("The counter has NOT been increased. The generated code is now invalid. You must use this code and confirm it to try again.");}
-       }
+                            if entry.otp_type == OtpType::Hotp {
+                                print!("Did you SUCCESSFULLY use this HOTP code? (Y/N): ");
+                                io::stdout().flush()?;
+                                let mut answer = String::new();
+                                io::stdin().read_line(&mut answer)?;
+        
+                                if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+                                    if let Some(mut_entry) = store.entries.get_mut(name) {
+                                        mut_entry.counter += 1;
+                                        println!("The HOTP counter has been updated to {}.", mut_entry.counter);
+                                        if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
+                                            println!("Warning: Updated counter could not be saved: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    println!("The counter has NOT been increased. The generated code is now invalid. You must use this code and confirm it to try again.");
+                                }
+                            }
                         }
                         None => {
                             println!("Failed to generate code. Check algorithm or secret.");
