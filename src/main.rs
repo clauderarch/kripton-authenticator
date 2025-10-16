@@ -743,9 +743,7 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         io::stdout().flush()?;
         let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
         let trimmed_pass1 = Zeroizing::new(pass1.trim().to_string());
-        drop(pass1);
         let trimmed_pass2 = Zeroizing::new(pass2.trim().to_string());
-        drop(pass2);
         if trimmed_pass1 != trimmed_pass2 {
             println!("Passwords do not match, operation canceled.");
             return Ok(());
@@ -1006,14 +1004,14 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
             io::stdout().flush()?;
             let mut secret = Zeroizing::new(String::new());
             io::stdin().read_line(&mut *secret)?;
-            let secret_trimmed = secret.trim().to_string();
+            let secret_trimmed = Zeroizing::new(secret.trim().to_string());
             if let Err(e) = validate_base32(&secret_trimmed) {
                 println!("Invalid secret: {}", e);
                 return Ok(());
             }
             
             if let Some(entry) = store.entries.get_mut(name) {
-                entry.secret = Zeroizing::new(secret_trimmed);
+                entry.secret = secret_trimmed;
                 encrypt_store(path, password, store)?;
                 println!("Secret updated for '{}'.", name);
             }
@@ -1129,7 +1127,7 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     io::stdout().flush()?;
     let mut secret = Zeroizing::new(String::new());
     io::stdin().read_line(&mut *secret)?;
-    let secret_trimmed = secret.trim().to_string();
+    let secret_trimmed = Zeroizing::new(secret.trim().to_string());
     if let Err(e) = validate_base32(&secret_trimmed) {
         println!("Error: {}", e);
         return Ok(());
@@ -1178,7 +1176,7 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
     };
 
     let mut new_entry = OtpEntry {
-        secret: Zeroizing::new(secret_trimmed),
+        secret: secret_trimmed,
         otp_type,
         algorithm,
         digits,
@@ -1294,10 +1292,8 @@ if any_store {
     print!("Enter your password: ");
     io::stdout().flush()?;
     current_password = Zeroizing::new({
-    let mut pass = read_password().map_err(|e| AppError::Io(e))?;
-    let result = pass.clone();
-    pass.zeroize();
-    result});
+    let pass = read_password().map_err(|e| AppError::Io(e))?;
+    pass.trim().to_string()});
 } else {
     print!("Set a new password: ");
     io::stdout().flush()?;
