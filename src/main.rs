@@ -89,6 +89,8 @@ struct OtpEntry {
     digits: u8,
     step: u64,
     counter: u64,
+    #[serde(default)]
+    note: Zeroizing<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -135,8 +137,8 @@ fn store_path_for_password(password: &str) -> AppResult<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     let result = hasher.finalize();
-    let hexdigest = format!("{:x}", result);
-    let prefix = &hexdigest[..8];
+    let hex_digest = format!("{:x}", result);
+    let prefix = &hex_digest[..8];
     let file_name = format!("{}_{}.enc", STORE_FILE_BASE, prefix);
     
     Ok(data_dir.join(file_name))
@@ -171,10 +173,10 @@ fn change_master_password(old_password: &Zeroizing<String>, store: &mut StoredDa
     println!("\n=== Master Password Change ===");
     print!("Enter NEW password: ");
     io::stdout().flush()?;
-    let mut new_pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let mut new_pass1 = Zeroizing::new(read_password()?);
     print!("Re-enter NEW password: ");
     io::stdout().flush()?;
-    let mut new_pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let mut new_pass2 = Zeroizing::new(read_password()?);
     
     let trimmed_new_pass1 = Zeroizing::new({
     let temp = new_pass1.trim().to_string();
@@ -265,12 +267,12 @@ fn parse_otpauth_uri(uri_str: &str) -> Result<(String, OtpEntry), String> {
         name_from_label
     };
     
-    let algorithm = match params.get("algorithm").map(|s| s.to_uppercase()).as_deref() {
-        Some("SHA256") => OtpAlgorithm::Sha256,
-        Some("SHA512") => OtpAlgorithm::Sha512,
+    let algorithm = match params.get("algorithm").map(|s| s.to_uppercase()) {
+        Some(s) if s == "SHA256" => OtpAlgorithm::Sha256,
+        Some(s) if s == "SHA512" => OtpAlgorithm::Sha512,
         _ => OtpAlgorithm::Sha1,
     };
-    
+
     let digits = match params.get("digits").and_then(|s| s.parse::<u8>().ok()) {
         Some(8) => 8,
         _ => 6,
@@ -283,6 +285,7 @@ fn parse_otpauth_uri(uri_str: &str) -> Result<(String, OtpEntry), String> {
         digits,
         step: 0,
         counter: 0,
+        note: Zeroizing::new(String::new()),
     };
 
     match otp_type {
@@ -365,7 +368,7 @@ fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = core_encrypt(&key, nonce, data)?; 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(nonce_bytes.len() + salt.len() + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&salt);
     result.extend_from_slice(&ciphertext);
@@ -391,7 +394,7 @@ fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()
     let mut plaintext = serde_json::to_vec(data)?;
     let ciphertext = core_encrypt(&key, nonce, &plaintext)?;
     plaintext.zeroize();
-    let mut file_data = Vec::new();
+    let mut file_data = Vec::with_capacity(nonce_bytes.len() + data.salt.len() + ciphertext.len());
     file_data.extend_from_slice(&nonce_bytes);
     file_data.extend_from_slice(&data.salt);
     file_data.extend_from_slice(&ciphertext);
@@ -448,7 +451,7 @@ fn validate_base32(secret: &str) -> Result<(), String> {
         return Err("Secret cannot be empty".to_string());
     }
     
-    let cleaned = secret.replace(" ", "").to_uppercase();
+    let cleaned = secret.replace(' ', "").to_uppercase();
     for ch in cleaned.chars() {
         if !matches!(ch, 'A'..='Z' | '2'..='7' | '=') {
             return Err(format!("Invalid character '{}' in base32 secret. Only A-Z, 2-7, and = are allowed.", ch));
@@ -466,8 +469,11 @@ fn get_remaining_seconds(step: u64) -> u64 {
 }
 
 fn calculate_otp(secret_b32: &Zeroizing<String>, counter: u64, algorithm: OtpAlgorithm, digits: u8) -> Option<Zeroizing<String>> {
-    let cleaned = Zeroizing::new(secret_b32.replace(" ", "").to_uppercase());
-    let secret_bytes = decode(Alphabet::Rfc4648 { padding: false }, &cleaned)?;
+    let cleaned = Zeroizing::new(secret_b32.replace(' ', "").to_uppercase());
+    let secret_bytes = match decode(Alphabet::Rfc4648 { padding: false }, &cleaned) {
+        Some(bytes) => bytes,
+        None => return None,
+    };
     let secret = Zeroizing::new(secret_bytes);
     let counter_bytes = counter.to_be_bytes();
 
@@ -558,10 +564,7 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
         
         for (j, c2) in s2.chars().enumerate() {
             let cost = if c1 == c2 { 0 } else { 1 };
-            curr_row[j + 1] = std::cmp::min(
-                std::cmp::min(curr_row[j] + 1, prev_row[j + 1] + 1),
-                prev_row[j] + cost
-            );
+            curr_row[j + 1] = prev_row[j + 1].min(curr_row[j] + 1).min(prev_row[j] + cost);
         }
         
         std::mem::swap(&mut prev_row, &mut curr_row);
@@ -655,6 +658,7 @@ fn otp_entry_to_string(name: &str, entry: &OtpEntry) -> Zeroizing<String> {
         OtpType::Totp => s.push_str(&format!("Step: {}\n", entry.step)),
         OtpType::Hotp => s.push_str(&format!("Counter: {}\n", entry.counter)),
     }
+    s.push_str(&format!("Note: {}\n", entry.note.as_str()));
     s.push('\n');
     s
 }
@@ -669,7 +673,7 @@ fn otp_entry_to_uri(name: &str, entry: &OtpEntry) -> Zeroizing<String> {
         "otpauth://{}/{}?secret={}&digits={}",
         type_str,
         label,
-        entry.secret.as_str().replace(" ", ""),
+        entry.secret.as_str().replace(' ', ""),
         entry.digits
     ));
 
@@ -728,6 +732,7 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
         for (name, entry) in &store.entries {
             plaintext.push_str(&otp_entry_to_uri(name, entry));
             plaintext.push('\n');
+            plaintext.push_str(&format!("Note: {}\n\n", entry.note.as_str()));
         }
     } else {
         for (name, entry) in &store.entries {
@@ -738,10 +743,10 @@ fn backup_codes(store: &StoredData) -> AppResult<()> {
     if is_enc {
         print!("Enter the backup password: ");
         io::stdout().flush()?;
-        let pass1 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+        let pass1 = Zeroizing::new(read_password()?);
         print!("Re-enter password: ");
         io::stdout().flush()?;
-        let pass2 = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+        let pass2 = Zeroizing::new(read_password()?);
         let trimmed_pass1 = Zeroizing::new(pass1.trim().to_string());
         let trimmed_pass2 = Zeroizing::new(pass2.trim().to_string());
         if trimmed_pass1 != trimmed_pass2 {
@@ -838,6 +843,7 @@ fn import_from_text(text: &str, store: &mut StoredData) -> usize {
             digits,
             step: 30,
             counter: 0,
+            note: Zeroizing::new(lines.get("Note").unwrap_or(&"").to_string()),
         };
 
         match otp_type {
@@ -892,7 +898,7 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
         print!("Enter your backup password: ");
         io::stdout().flush()?;
         let trimmed_pass = Zeroizing::new({
-        let pass = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+        let pass = Zeroizing::new(read_password()?);
         pass.trim().to_string()});
         match decrypt_data(&data, &trimmed_pass) {
             Ok(plaintext) => {
@@ -926,23 +932,36 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
 
 fn import_from_uri_list(text: &str, store: &mut StoredData) -> usize {
     let mut added = 0;
-    for line in text.lines() {
+    let mut lines_iter = text.lines().peekable();
+    while let Some(line) = lines_iter.next() {
         if line.trim().is_empty() {
             continue;
         }
-        match parse_otpauth_uri(line) {
-            Ok((name, entry)) => {
-                if !store.entries.contains_key(&name) {
-                    store.entries.insert(name.clone(), entry);
-                    println!("- Imported '{}'", name);
-                    added += 1;
-                } else {
-                    println!("- Skipped '{}' (already exists).", name);
+        let mut note = Zeroizing::new(String::new());
+        if line.starts_with("otpauth://") {
+            if let Some(next_line) = lines_iter.peek() {
+                if next_line.starts_with("Note: ") {
+                    note = Zeroizing::new(next_line.strip_prefix("Note: ").unwrap_or("").to_string());
+                    let _ = lines_iter.next();
                 }
             }
-            Err(e) => {
-                println!("- Warning: Could not parse a line: '{}'. Error: {}", line, e);
+            match parse_otpauth_uri(line) {
+                Ok((name, mut entry)) => {
+                    entry.note = note;
+                    if !store.entries.contains_key(&name) {
+                        store.entries.insert(name.clone(), entry);
+                        println!("- Imported '{}'", name);
+                        added += 1;
+                    } else {
+                        println!("- Skipped '{}' (already exists).", name);
+                    }
+                }
+                Err(e) => {
+                    println!("- Warning: Could not parse a line: '{}'. Error: {}", line, e);
+                }
             }
+        } else {
+            println!("- Warning: Unexpected line: '{}'. Skipping.", line);
         }
     }
     added
@@ -968,7 +987,8 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
     println!("1) Rename account");
     println!("2) Change secret");
     println!("3) Change parameters (Type, Algorithm, Digits, Step/Counter)");
-    println!("4) Cancel");
+    println!("4) Change note");
+    println!("5) Cancel");
     print!("Choice: ");
     io::stdout().flush()?;
     
@@ -1100,6 +1120,19 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
 
         }
         "4" => {
+            print!("Enter new note (leave blank for none): ");
+            io::stdout().flush()?;
+            let mut note = Zeroizing::new(String::new());
+            io::stdin().read_line(&mut *note)?;
+            let note_trimmed = Zeroizing::new(note.trim().to_string());
+            
+            if let Some(entry) = store.entries.get_mut(name) {
+                entry.note = note_trimmed;
+                encrypt_store(path, password, store)?;
+                println!("Note updated for '{}'.", name);
+            }
+        }
+        "5" => {
             println!("Edit cancelled.");
         }
         _ => println!("Invalid choice."),
@@ -1182,6 +1215,7 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
         digits,
         step: 0,
         counter: 0,
+        note: Zeroizing::new(String::new()),
     };
 
     match otp_type {
@@ -1212,6 +1246,12 @@ fn add_account_interactive(store: &mut StoredData, path: &Path, password: &str) 
             };
         }
     }
+
+    print!("Enter note (optional, leave blank for none): ");
+    io::stdout().flush()?;
+    let mut note = Zeroizing::new(String::new());
+    io::stdin().read_line(&mut *note)?;
+    new_entry.note = Zeroizing::new(note.trim().to_string());
     
     store.entries.insert(name.clone(), new_entry);
     encrypt_store(path, password, store)?;
@@ -1292,15 +1332,15 @@ if any_store {
     print!("Enter your password: ");
     io::stdout().flush()?;
     current_password = Zeroizing::new({
-    let pass = read_password().map_err(|e| AppError::Io(e))?;
+    let pass = read_password()?;
     pass.trim().to_string()});
 } else {
     print!("Set a new password: ");
     io::stdout().flush()?;
-    let first = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let first = Zeroizing::new(read_password()?);
     print!("Re-enter password: ");
     io::stdout().flush()?;
-    let second = Zeroizing::new(read_password().map_err(|e| AppError::Io(e))?);
+    let second = Zeroizing::new(read_password()?);
     let trimmed_first = Zeroizing::new(first.trim().to_string());
     let trimmed_second = Zeroizing::new(second.trim().to_string());
     if trimmed_first.as_str() != trimmed_second.as_str() {
@@ -1348,7 +1388,8 @@ if any_store {
         println!("6) Backup codes");
         println!("7) Restore codes");
         println!("8) Settings");
-        println!("9) Exit");
+        println!("9) View note");
+        println!("10) Exit");
 
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
@@ -1493,6 +1534,23 @@ if any_store {
                 }
             }
             "9" => {
+                print!("Account name to view note: ");
+                io::stdout().flush()?;
+                let mut name = String::new();
+                io::stdin().read_line(&mut name)?;
+                let name = name.trim();
+                if let Some(entry) = store.entries.get(name) {
+                    if entry.note.is_empty() {
+                        println!("No note for '{}'.", name);
+                    } else {
+                        println!("Note for '{}': {}", name, entry.note.as_str());
+                    }
+                } else {
+                    println!("Account '{}' not found.", name);
+                    suggest_similar_accounts(name, &store.entries);
+                }
+            }
+            "10" => {
                 println!("Exiting...");
                 break;
             }
@@ -1574,6 +1632,7 @@ mod tests {
             digits: 6,
             step: 30,
             counter: 0,
+            note: Zeroizing::new(String::new()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: OtpEntry = serde_json::from_str(&json).unwrap();
@@ -1659,6 +1718,7 @@ Counter: 5
                 digits: 6,
                 step: 30,
                 counter: 0,
+                note: Zeroizing::new(String::new()),
             },
         );
         
@@ -1793,6 +1853,7 @@ Counter: 5
                 digits: 6,
                 step: 30,
                 counter: 0,
+                note: Zeroizing::new(String::new()),
             },
         );
         entries.insert(
@@ -1804,6 +1865,7 @@ Counter: 5
                 digits: 6,
                 step: 30,
                 counter: 0,
+                note: Zeroizing::new(String::new()),
             },
         );
         suggest_similar_accounts("Githb", &entries);
