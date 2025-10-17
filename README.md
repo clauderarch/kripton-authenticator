@@ -96,24 +96,23 @@ Warning: If you forget your master password, your accounts cannot be recovered. 
 
 
 ### Main Menu Options:
+**Get code:** Generate an OTP code for a specific account. Optionally copies to clipboard.
 
 **Add account:** Add a new TOTP or HOTP account with a custom name, secret, algorithm (SHA-1, SHA-256, SHA-512), and digits (6 or 8).
 
-**Get code:** Generate an OTP code for a specific account. Optionally copies to clipboard.
-
 **Edit account:** Modify account name, secret, parameters, or notes.
+
+**List accounts:** Display all saved accounts with their type, algorithm, and digits.
 
 **Delete account:** Remove an account from the store.
 
-**List accounts:** Display all saved accounts with their type, algorithm, and digits.
+**View note:** Display the note associated with an account.
 
 **Backup codes:** Export accounts in plain text, encrypted, or ```otpauth://``` URI format.
 
 **Restore codes:** Import accounts from a backup file (plain text, encrypted, or URI format).
 
 **Settings:** Toggle auto-copy to clipboard, hide OTP codes, or change the master password.
-
-**View note:** Display the note associated with an account.
 
 **Exit:** Close the application.
 
