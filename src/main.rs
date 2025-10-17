@@ -1380,26 +1380,21 @@ if any_store {
         };
     };
     loop {
-        println!("\n1) Add account");
-        println!("2) Get code");
+        println!("\n1) Get code");
+        println!("2) Add account");
         println!("3) Edit account");
         println!("4) Delete account");
         println!("5) List accounts");
         println!("6) Backup codes");
         println!("7) Restore codes");
-        println!("8) Settings");
-        println!("9) View note");
+        println!("8) View note");
+        println!("9) Settings");
         println!("10) Exit");
 
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
         match choice.trim() {
             "1" => {
-                if let Err(e) = add_account_interactive(&mut store, &current_path, current_password.as_str()) {
-                     eprintln!("Error adding account: {}", e);
-                }
-            }
-            "2" => {
                 print!("Account name: ");
                 io::stdout().flush()?;
                 let mut name = String::new();
@@ -1462,6 +1457,12 @@ if any_store {
                     suggest_similar_accounts(name, &store.entries);
                 }
             }
+            "2" => {
+                if let Err(e) = add_account_interactive(&mut store, &current_path, current_password.as_str()) {
+                     eprintln!("Error adding account: {}", e);
+                }
+            }
+
             "3" => {
                 if let Err(e) = edit_account(&mut store, &current_path, current_password.as_str()) {
                     eprintln!("Error saving store: {}", e);
@@ -1515,6 +1516,23 @@ if any_store {
                 }
             }
             "8" => {
+                print!("Account name to view note: ");
+                io::stdout().flush()?;
+                let mut name = String::new();
+                io::stdin().read_line(&mut name)?;
+                let name = name.trim();
+                if let Some(entry) = store.entries.get(name) {
+                    if entry.note.is_empty() {
+                        println!("No note for '{}'.", name);
+                    } else {
+                        println!("Note for '{}': {}", name, entry.note.as_str());
+                    }
+                } else {
+                    println!("Account '{}' not found.", name);
+                    suggest_similar_accounts(name, &store.entries);
+                }
+            }
+            "9" => {
                 match settings_menu(&mut store, &current_path, &mut current_password) {
                     Ok(_) => {
                         current_path = store_path_for_password(current_password.as_str())?;
@@ -1531,23 +1549,6 @@ if any_store {
                         println!("Settings error: {}", e);
                         return Err(e);
                     }
-                }
-            }
-            "9" => {
-                print!("Account name to view note: ");
-                io::stdout().flush()?;
-                let mut name = String::new();
-                io::stdin().read_line(&mut name)?;
-                let name = name.trim();
-                if let Some(entry) = store.entries.get(name) {
-                    if entry.note.is_empty() {
-                        println!("No note for '{}'.", name);
-                    } else {
-                        println!("Note for '{}': {}", name, entry.note.as_str());
-                    }
-                } else {
-                    println!("Account '{}' not found.", name);
-                    suggest_similar_accounts(name, &store.entries);
                 }
             }
             "10" => {
