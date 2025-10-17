@@ -1382,12 +1382,12 @@ if any_store {
     loop {
         println!("\n1) Get code");
         println!("2) Add account");
-        println!("3) Edit account");
-        println!("4) Delete account");
-        println!("5) List accounts");
-        println!("6) Backup codes");
-        println!("7) Restore codes");
-        println!("8) View note");
+        println!("3) List accounts");
+        println!("4) Edit account");
+        println!("5) Delete account");
+        println!("6) View note");
+        println!("7) Backup codes");
+        println!("8) Restore codes");
         println!("9) Settings");
         println!("10) Exit");
 
@@ -1462,13 +1462,27 @@ if any_store {
                      eprintln!("Error adding account: {}", e);
                 }
             }
-
             "3" => {
+                if store.entries.is_empty() {
+                    println!("No accounts saved yet.");
+                } else {
+                    println!("\nSaved Accounts (Name | Type | Algorithm | Digits):");
+                    let mut sorted_keys: Vec<_> = store.entries.keys().collect();
+                    sorted_keys.sort_by_key(|a| a.to_lowercase());
+                    for name in sorted_keys.iter() {
+                        let entry = store.entries.get(*name).unwrap();
+                        println!("- {} | {:?} | {:?} | {}", 
+                                 name, entry.otp_type, entry.algorithm, entry.digits);
+                    }
+                }
+            }
+
+            "4" => {
                 if let Err(e) = edit_account(&mut store, &current_path, current_password.as_str()) {
                     eprintln!("Error saving store: {}", e);
                 }
             }
-            "4" => {
+            "5" => {
                 print!("Account to delete: ");
                 io::stdout().flush()?;
                 let mut name = String::new();
@@ -1485,37 +1499,7 @@ if any_store {
                     suggest_similar_accounts(name, &store.entries);
                 }
             }
-            "5" => {
-                if store.entries.is_empty() {
-                    println!("No accounts saved yet.");
-                } else {
-                    println!("\nSaved Accounts (Name | Type | Algorithm | Digits):");
-                    let mut sorted_keys: Vec<_> = store.entries.keys().collect();
-                    sorted_keys.sort_by_key(|a| a.to_lowercase());
-                    for name in sorted_keys.iter() {
-                        let entry = store.entries.get(*name).unwrap();
-                        println!("- {} | {:?} | {:?} | {}", 
-                                 name, entry.otp_type, entry.algorithm, entry.digits);
-                    }
-                }
-            }
             "6" => {
-                if let Err(e) = backup_codes(&store) {
-                    println!("Backup error: {}", e);
-                }
-            }
-            "7" => {
-                if let Err(e) = restore_codes_interactive(&mut store) {
-                    println!("Restore error: {}", e);
-                } else {
-                    if store.entries.len() > 0 {
-                       if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
-                           println!("Warning: Could not save store after successful restore: {}", e);
-                       }
-                    }
-                }
-            }
-            "8" => {
                 print!("Account name to view note: ");
                 io::stdout().flush()?;
                 let mut name = String::new();
@@ -1530,6 +1514,22 @@ if any_store {
                 } else {
                     println!("Account '{}' not found.", name);
                     suggest_similar_accounts(name, &store.entries);
+                }
+            }
+            "7" => {
+                if let Err(e) = backup_codes(&store) {
+                    println!("Backup error: {}", e);
+                }
+            }
+            "8" => {
+                if let Err(e) = restore_codes_interactive(&mut store) {
+                    println!("Restore error: {}", e);
+                } else {
+                    if store.entries.len() > 0 {
+                       if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
+                           println!("Warning: Could not save store after successful restore: {}", e);
+                       }
+                    }
                 }
             }
             "9" => {
