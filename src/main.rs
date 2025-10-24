@@ -6,8 +6,18 @@ use std::{
     path::{Path, PathBuf},
 };
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng, generic_array::GenericArray, rand_core::RngCore},
-    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    Aes256Gcm, Nonce, Key,
+};
+use rustyline::{
+    completion::{Completer, Pair},
+    error::ReadlineError,
+    Editor, Config, CompletionType, EditMode,
+    Helper,
+    validate::Validator,
+    highlight::Highlighter,
+    hint::Hinter,
+    history::DefaultHistory,
 };
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
@@ -23,10 +33,10 @@ use argon2::{Argon2, Params, Version, Algorithm as ArgonAlgorithm};
 use directories::ProjectDirs;
 use zeroize::{Zeroizing, Zeroize};
 use thiserror::Error;
-use typenum::{U12};
 use url::Url;
 use urlencoding::decode as url_decode;
 use urlencoding::encode;
+
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -48,7 +58,75 @@ enum AppError {
     Cancelled(String),
     #[error("Clipboard error: {0}")]
     Clipboard(String),
+    #[error("Readline error: {0}")]
+    Readline(String),
 }
+
+struct AccountCompleter {
+    accounts: Vec<String>,
+}
+
+impl Completer for AccountCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        _pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> Result<(usize, Vec<Pair>), ReadlineError> {
+        let input = line.trim().to_lowercase();
+        
+        if input.is_empty() {
+            return Ok((0, vec![]));
+        }
+
+        let mut suggestions: Vec<(String, usize)> = self
+            .accounts
+            .iter()
+            .filter_map(|name| {
+                let name_lower = name.to_lowercase();
+                
+                if name_lower.starts_with(&input) {
+                    return Some((name.clone(), 0));
+                }
+                
+                for word in name_lower.split(|c: char| c == ' ' || c == '-' || c == '_' || c == ':') {
+                    if !word.is_empty() && word.starts_with(&input) {
+                        return Some((name.clone(), 1));
+                    }
+                }
+                
+                None
+            })
+            .collect();
+
+        suggestions.sort_by(|(name_a, priority_a), (name_b, priority_b)| {
+            priority_a.cmp(priority_b)
+                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase()))
+        });
+        
+        suggestions.truncate(10);
+
+        let completions = suggestions
+            .into_iter()
+            .map(|(name, _)| Pair {
+                display: name.clone(),
+                replacement: name,
+            })
+            .collect();
+
+        Ok((0, completions))
+    }
+}
+
+impl Helper for AccountCompleter {}
+impl Validator for AccountCompleter {}
+impl Highlighter for AccountCompleter {}
+impl Hinter for AccountCompleter {
+    type Hint = String;
+}
+
 impl From<argon2::password_hash::Error> for AppError {
     fn from(err: argon2::password_hash::Error) -> Self {
         AppError::Argon2Hash(err.to_string())
@@ -62,6 +140,11 @@ impl From<argon2::Error> for AppError {
 impl From<arboard::Error> for AppError {
     fn from(err: arboard::Error) -> Self {
         AppError::Clipboard(err.to_string())
+    }
+}
+impl From<ReadlineError> for AppError {
+    fn from(err: ReadlineError) -> Self {
+        AppError::Readline(err.to_string())
     }
 }
 type AppResult<T> = Result<T, AppError>;
@@ -135,6 +218,24 @@ fn get_project_dirs() -> AppResult<PathBuf> {
             "Could not find a valid home directory.",
         )))
     }
+}
+
+fn read_account_name(
+    prompt: &str,
+    entries: &HashMap<String, OtpEntry>,
+) -> AppResult<Zeroizing<String>> {
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .edit_mode(EditMode::Emacs)
+        .build();
+    let mut rl = Editor::<AccountCompleter, DefaultHistory>::with_config(config)?;
+    rl.set_helper(Some(AccountCompleter {
+        accounts: entries.keys().cloned().collect(),
+    }));
+
+    let input = rl.readline(prompt)?;
+    let trimmed = Zeroizing::new(input.trim().to_string());
+    Ok(trimmed)
 }
 
 fn store_path_for_password(password: &str) -> AppResult<PathBuf> {
@@ -359,21 +460,23 @@ fn derive_key(password: &str, salt: &[u8]) -> AppResult<Zeroizing<[u8; KEY_SIZE]
 
 fn core_encrypt(
     key: &Zeroizing<[u8; KEY_SIZE]>,
-    nonce: &Nonce<U12>,
+    nonce: &[u8; NONCE_SIZE],
     data: &[u8],
 ) -> AppResult<Vec<u8>> {
-    let cipher = Aes256Gcm::new(&GenericArray::from(**key));
-    cipher.encrypt(nonce, data).map_err(|_| AppError::Crypto)
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&**key));
+    let nonce_array = Nonce::from_slice(nonce);
+    cipher.encrypt(nonce_array, data).map_err(|_| AppError::Crypto)
 }
 
 fn core_decrypt(
     key: &Zeroizing<[u8; KEY_SIZE]>,
-    nonce: &Nonce<U12>,
+    nonce: &[u8; NONCE_SIZE],
     ciphertext: &[u8],
 ) -> AppResult<Zeroizing<Vec<u8>>> {
-    let cipher = Aes256Gcm::new(&GenericArray::from(**key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&**key));
+    let nonce_array = Nonce::from_slice(nonce);
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(nonce_array, ciphertext)
         .map_err(|_| AppError::Crypto)?;
     Ok(Zeroizing::new(plaintext))
 }
@@ -384,8 +487,7 @@ fn encrypt_data(data: &[u8], password: &str) -> AppResult<Vec<u8>> {
     let key = derive_key(password, &salt)?;
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = core_encrypt(&key, nonce, data)?;
+    let ciphertext = core_encrypt(&key, &nonce_bytes, data)?;
     let mut result = Vec::with_capacity(nonce_bytes.len() + salt.len() + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&salt);
@@ -400,18 +502,17 @@ fn decrypt_data(data: &[u8], password: &str) -> AppResult<Zeroizing<Vec<u8>>> {
     let (nonce_bytes, rest) = data.split_at(NONCE_SIZE);
     let (salt, ciphertext) = rest.split_at(SALT_SIZE);
     let key = derive_key(password, salt)?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    core_decrypt(&key, nonce, ciphertext)
+    let nonce_array: [u8; NONCE_SIZE] = nonce_bytes.try_into().unwrap();
+    core_decrypt(&key, &nonce_array, ciphertext)
 }
 
 fn encrypt_store(path: &Path, password: &str, data: &StoredData) -> AppResult<()> {
     let key = derive_key(password, &data.salt)?;
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
     let mut plaintext = Zeroizing::new(Vec::new());
     serde_json::to_writer(&mut *plaintext, data)?;
-    let ciphertext = core_encrypt(&key, nonce, &*plaintext)?;
+    let ciphertext = core_encrypt(&key, &nonce_bytes, &*plaintext)?;
     plaintext.zeroize();
     let mut file_data = Vec::with_capacity(nonce_bytes.len() + data.salt.len() + ciphertext.len());
     file_data.extend_from_slice(&nonce_bytes);
@@ -458,8 +559,8 @@ fn decrypt_store(path: &Path, password: &str) -> AppResult<StoredData> {
     let (nonce_bytes, rest) = data.split_at(NONCE_SIZE);
     let (salt, ciphertext) = rest.split_at(SALT_SIZE);
     let key = derive_key(password, salt)?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext_zeroizing = core_decrypt(&key, nonce, ciphertext)?;
+    let nonce_array: [u8; NONCE_SIZE] = nonce_bytes.try_into().unwrap();
+    let plaintext_zeroizing = core_decrypt(&key, &nonce_array, ciphertext)?;
     let parsed: StoredData = serde_json::from_slice(&*plaintext_zeroizing)?;
 
     Ok(parsed)
@@ -965,7 +1066,10 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
         });
         match decrypt_data(&data, &trimmed_pass) {
             Ok(plaintext) => {
-                let text = String::from_utf8_lossy(&*plaintext);
+                let text = Zeroizing::new(
+                    String::from_utf8(plaintext.to_vec())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&*plaintext).into_owned())
+                );
                 if text.trim().starts_with("otpauth://") {
                     import_from_uri_list(&text, store)
                 } else {
@@ -985,7 +1089,7 @@ fn restore_codes_interactive(store: &mut StoredData) -> AppResult<()> {
             Err(e) => return Err(e),
         }
     } else {
-        let text = String::from_utf8_lossy(&data);
+        let text = Zeroizing::new(String::from_utf8_lossy(&data).into_owned());
         if text.trim().starts_with("otpauth://") {
             println!("otpauth:// URI list detected. Importing...");
             import_from_uri_list(&text, store)
@@ -1041,13 +1145,7 @@ fn import_from_uri_list(text: &str, store: &mut StoredData) -> usize {
     added
 }
 
-fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResult<()> {
-    print!("Account name to edit: ");
-    io::stdout().flush()?;
-    let mut name = Zeroizing::new(String::new());
-    io::stdin().read_line(&mut *name)?;
-    let name = name.trim();
-
+fn edit_account(store: &mut StoredData, path: &Path, password: &str, name: &str) -> AppResult<()> {
     if !store.entries.contains_key(name) {
         println!("Account '{}' not found.", name);
         suggest_similar_accounts(name, &store.entries);
@@ -1210,7 +1308,7 @@ fn edit_account(store: &mut StoredData, path: &Path, password: &str) -> AppResul
             println!("Parameters updated for '{}'.", name);
         }
         "4" => {
-            print!("Enter new note (leave blank for none): ");
+            print!("Enter new note: ");
             io::stdout().flush()?;
             let mut note = Zeroizing::new(String::new());
             io::stdin().read_line(&mut *note)?;
@@ -1504,25 +1602,25 @@ fn settings_menu(
 
 fn main() -> AppResult<()> {
     println!(
-        r" $$\   $$\                  $$$$$$\              $$\     $$\       "
+        r" $\   $\                  $$$\              $\     $\       "
     );
     println!(
-        r" $$ | $$  |                $$  __$$\             $$ |    $$ |      "
+        r" $ | $  |                $  __$\             $ |    $ |      "
     );
     println!(
-        r" $$ |$$  /  $$$$$$\        $$ /  $$ |$$\   $$\ $$$$$$\   $$$$$$$\  "
+        r" $ |$  /  $$$\        $ /  $ |$\   $\ $$$\   $$$$\  "
     );
     println!(
-        r" $$$$$  /  $$  __$$\       $$$$$$$$ |$$ |  $$ |\_$$  _|  $$  __$$\ "
+        r" $$$  /  $  __$\       $$$$ |$ |  $ |\_$  _|  $  __$\ "
     );
     println!(
-        r" $$  $$<   $$ |  \__|      $$  __$$ |$$ |  $$ |  $$ |    $$ |  $$ |"
+        r" $  $<   $ |  \__|      $  __$ |$ |  $ |  $ |    $ |  $ |"
     );
     println!(
-        r" $$ |\$$\  $$ |            $$ |  $$ |$$ |  $$ |  $$ |$$\ $$ |  $$ |"
+        r" $ |\$\  $ |            $ |  $ |$ |  $ |  $ |$\ $ |  $ |"
     );
     println!(
-        r" $$ | \$$\ $$ |            $$ |  $$ |\$$$$$$  |  \$$$$  |$$ |  $$ |"
+        r" $ | \$\ $ |            $ |  $ |\$$$  |  \$$  |$ |  $ |"
     );
     println!(
         r" \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|"
@@ -1621,12 +1719,18 @@ fn main() -> AppResult<()> {
         io::stdin().read_line(&mut *choice)?;
         match choice.trim() {
             "1" => {
-                print!("Account name: ");
-                io::stdout().flush()?;
-                let mut name = Zeroizing::new(String::new());
-                io::stdin().read_line(&mut *name)?;
-                let name = name.trim();
-                if let Some(entry) = store.entries.get(name) {
+                let name = match read_account_name("Account name: ", &store.entries) {
+                    Ok(name) => name,
+                    Err(AppError::Io(e)) if e.to_string().contains("EOF") => {
+                        println!("Input cancelled.");
+                        continue;
+                    }
+                    Err(e) => {
+                        println!("Error reading input: {}", e);
+                        continue;
+                    }
+                };
+                if let Some(entry) = store.entries.get(name.as_str()) {
                     match generate_otp(entry) {
                         Some((code, remaining)) => {
                             if store.settings.hide_otp_codes {
@@ -1662,7 +1766,7 @@ fn main() -> AppResult<()> {
                                 io::stdin().read_line(&mut *answer)?;
 
                                 if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-                                    if let Some(mut_entry) = store.entries.get_mut(name) {
+                                    if let Some(mut_entry) = store.entries.get_mut(name.as_str()) {
                                         mut_entry.counter += 1;
                                         println!(
                                             "The HOTP counter has been updated to {}.",
@@ -1688,7 +1792,7 @@ fn main() -> AppResult<()> {
                     }
                 } else {
                     println!("Account not found.");
-                    suggest_similar_accounts(name, &store.entries);
+                    suggest_similar_accounts(&name, &store.entries);
                 }
             }
             "2" => {
@@ -1714,42 +1818,65 @@ fn main() -> AppResult<()> {
             }
 
             "4" => {
-                if let Err(e) = edit_account(&mut store, &current_path, current_password.as_str()) {
+                let name = match read_account_name("Account name to edit: ", &store.entries) {
+                    Ok(name) => name,
+                    Err(AppError::Io(e)) if e.to_string().contains("EOF") => {
+                        println!("Input cancelled.");
+                        continue;
+                    }
+                    Err(e) => {
+                        println!("Error reading input: {}", e);
+                        continue;
+                    }
+                };
+                if let Err(e) = edit_account(&mut store, &current_path, current_password.as_str(), &name) {
                     eprintln!("Error saving store: {}", e);
                 }
             }
             "5" => {
-                print!("Account to delete: ");
-                io::stdout().flush()?;
-                let mut name = Zeroizing::new(String::new());
-                io::stdin().read_line(&mut *name)?;
-                let name = name.trim();
-                if store.entries.remove(name).is_some() {
+                let name = match read_account_name("Account to delete: ", &store.entries) {
+                    Ok(name) => name,
+                    Err(AppError::Io(e)) if e.to_string().contains("EOF") => {
+                        println!("Input cancelled.");
+                        continue;
+                    }
+                    Err(e) => {
+                        println!("Error reading input: {}", e);
+                        continue;
+                    }
+                };
+                if store.entries.remove(name.as_str()).is_some() {
                     if let Err(e) = encrypt_store(&current_path, &current_password, &store) {
                         println!("Warning: Could not save store after deletion: {}", e);
                     } else {
-                        println!("Account '{}' deleted.", name);
+                        println!("Account '{}' deleted.", name.as_str());
                     }
                 } else {
-                    println!("Account '{}' not found.", name);
-                    suggest_similar_accounts(name, &store.entries);
+                    println!("Account '{}' not found.", name.as_str());
+                    suggest_similar_accounts(&name, &store.entries);
                 }
             }
             "6" => {
-                print!("Account name to view note: ");
-                io::stdout().flush()?;
-                let mut name = Zeroizing::new(String::new());
-                io::stdin().read_line(&mut *name)?;
-                let name = name.trim();
-                if let Some(entry) = store.entries.get(name) {
+                let name = match read_account_name("Account name to view note: ", &store.entries) {
+                    Ok(name) => name,
+                    Err(AppError::Io(e)) if e.to_string().contains("EOF") => {
+                        println!("Input cancelled.");
+                        continue;
+                    }
+                    Err(e) => {
+                        println!("Error reading input: {}", e);
+                        continue;
+                    }
+                };
+                if let Some(entry) = store.entries.get(name.as_str()) {
                     if entry.note.is_empty() {
-                        println!("No note for '{}'.", name);
+                        println!("No note for '{}'.", name.as_str());
                     } else {
-                        println!("Note for '{}': {}", name, entry.note.as_str());
+                        println!("Note for '{}': {}", name.as_str(), entry.note.as_str());
                     }
                 } else {
-                    println!("Account '{}' not found.", name);
-                    suggest_similar_accounts(name, &store.entries);
+                    println!("Account '{}' not found.", name.as_str());
+                    suggest_similar_accounts(&name, &store.entries);
                 }
             }
             "7" => {
@@ -2066,14 +2193,15 @@ Counter: 5
         let tmp_path = store_path.with_extension("tmp");
         assert!(!tmp_path.exists());
     }
+    
     #[test]
     fn test_zeroizing_drops_correctly() {
-    use zeroize::Zeroize;
-    let mut secret = Zeroizing::new(String::from("sensitive_data"));
-    assert_eq!(*secret, "sensitive_data", "Initial data should match");
-    secret.zeroize();
-    assert!(secret.is_empty(), "String should be empty after zeroizing");
-    *secret = String::from("new_data");
-    assert_eq!(*secret, "new_data", "String should accept new data after zeroizing");
-     }
+        use zeroize::Zeroize;
+        let mut secret = Zeroizing::new(String::from("sensitive_data"));
+        assert_eq!(*secret, "sensitive_data", "Initial data should match");
+        secret.zeroize();
+        assert!(secret.is_empty(), "String should be empty after zeroizing");
+        *secret = String::from("new_data");
+        assert_eq!(*secret, "new_data", "String should accept new data after zeroizing");
+    }
 }
