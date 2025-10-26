@@ -7,7 +7,7 @@ use std::{
 };
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
-    Aes256Gcm, Nonce, Key,
+    Aes256Gcm
 };
 use rustyline::{
     completion::{Completer, Pair},
@@ -86,11 +86,10 @@ impl Completer for AccountCompleter {
             .iter()
             .filter_map(|name| {
                 let name_lower = name.to_lowercase();
-                
                 if name_lower.starts_with(&input) {
                     return Some((name.clone(), 0));
                 }
-                
+
                 for word in name_lower.split(|c: char| c == ' ' || c == '-' || c == '_' || c == ':') {
                     if !word.is_empty() && word.starts_with(&input) {
                         return Some((name.clone(), 1));
@@ -463,9 +462,10 @@ fn core_encrypt(
     nonce: &[u8; NONCE_SIZE],
     data: &[u8],
 ) -> AppResult<Vec<u8>> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&**key));
-    let nonce_array = Nonce::from_slice(nonce);
-    cipher.encrypt(nonce_array, data).map_err(|_| AppError::Crypto)
+    let cipher = Aes256Gcm::new_from_slice(&**key)
+        .map_err(|_| AppError::Crypto)?;
+    let nonce_array = (*nonce).into();
+    cipher.encrypt(&nonce_array, data).map_err(|_| AppError::Crypto)
 }
 
 fn core_decrypt(
@@ -473,10 +473,11 @@ fn core_decrypt(
     nonce: &[u8; NONCE_SIZE],
     ciphertext: &[u8],
 ) -> AppResult<Zeroizing<Vec<u8>>> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&**key));
-    let nonce_array = Nonce::from_slice(nonce);
+    let cipher = Aes256Gcm::new_from_slice(&**key)
+        .map_err(|_| AppError::Crypto)?;
+    let nonce_array = (*nonce).into();
     let plaintext = cipher
-        .decrypt(nonce_array, ciphertext)
+        .decrypt(&nonce_array, ciphertext)
         .map_err(|_| AppError::Crypto)?;
     Ok(Zeroizing::new(plaintext))
 }
@@ -1609,14 +1610,12 @@ fn main() -> AppResult<()> {
     println!(r" $$ |\$$\  $$ |            $$ |  $$ |$$ |  $$ |  $$ |$$\ $$ |  $$ |");
     println!(r" $$ | \$$\ $$ |            $$ |  $$ |\$$$$$$  |  \$$$$  |$$ |  $$ |");
     println!(r" \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|");
-    println!("--------------------------------------------------");
+    println!("<-------------------------------------------------->");
     println!(" Attention:");
     println!(" This application encrypts your data locally.");
-    println!(
-        " If you forget your master password, you will not be able to recover your saved accounts."
-    );
+    println!(" If you forget your master password, you will not be able to recover your saved accounts.");
     println!(" Use the backup feature to store your data securely.");
-    println!("--------------------------------------------------");
+    println!("<-------------------------------------------------->");
     println!("Press Enter to continue...");
     io::stdout().flush()?;
     let mut dummy = Zeroizing::new(String::new());
