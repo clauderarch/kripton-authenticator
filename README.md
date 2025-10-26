@@ -1,32 +1,48 @@
 # Kripton Authenticator
-Kripton Authenticator is a command-line-based two-factor authentication (2FA) application written in Rust. It supports both Time-based One-Time Passwords (TOTP) and HMAC-based One-Time Passwords (HOTP), allowing users to securely manage their 2FA codes. The application encrypts all data locally using AES-256-GCM and derives encryption keys with Argon2id, ensuring high security for stored secrets.
+
+```
+ $$\   $$\                  $$$$$$\              $$\     $$\       
+ $$ | $$  |                $$  __$$\             $$ |    $$ |      
+ $$ |$$  /  $$$$$$\        $$ /  $$ |$$\   $$\ $$$$$$\   $$$$$$$\  
+ $$$$$  /  $$  __$$\       $$$$$$$$ |$$ |  $$ |\_$$  _|  $$  __$$\ 
+ $$  $$<   $$ |  \__|      $$  __$$ |$$ |  $$ |  $$ |    $$ |  $$ |
+ $$ |\$$\  $$ |            $$ |  $$ |$$ |  $$ |  $$ |$$\ $$ |  $$ |
+ $$ | \$$\ $$ |            $$ |  $$ |\$$$$$$  |  \$$$$  |$$ |  $$ |
+ \__|  \__|\__|            \__|  \__| \______/    \____/ \__|  \__|
+```
+
+**A secure, terminal-based two-factor authentication (2FA) code generator**
+
+## Overview
+
+Kripton Authenticator is a command-line authenticator application that provides secure storage and generation of Time-based One-Time Passwords (TOTP) and HMAC-based One-Time Passwords (HOTP). Built with security in mind, it uses industry-standard encryption algorithms to protect your 2FA secrets locally.
 
 ## Features
 
-**TOTP and HOTP Support:** Generate one-time passwords for both time-based and counter-based authentication.
-
-**Secure Storage:** Encrypts secrets using AES-256-GCM with keys derived from a master password via Argon2id.
-
-**Clipboard Integration:** Automatically copy generated OTP codes to the clipboard (optional).
-
-**Backup and Restore:** Export and import accounts in plain text, encrypted, or otpauth:// URI format for QR code compatibility.
-
-**Interactive CLI:** User-friendly interface to add, edit, delete, and manage accounts.
-
-**Account Management:** Rename accounts, update secrets, modify parameters (type, algorithm, digits, step/counter), and add notes.
-
-**Error Handling:** Robust error handling with custom error types for I/O, cryptographic, and user input issues.
-
-**Secure File Handling:** Temporary files are securely deleted, and store files have restricted permissions (0o600).
+- **Military-Grade Encryption**: AES-256-GCM encryption with Argon2id key derivation
+- **TOTP & HOTP Support**: Generate both time-based and counter-based one-time passwords
+- **Multiple Hash Algorithms**: SHA-1, SHA-256, and SHA-512 support
+- **Auto-Copy to Clipboard**: Optionally copy codes automatically (with configurable privacy mode)
+- **Import/Export**: Backup and restore your accounts with encrypted or plain text formats
+- **otpauth:// URI Support**: Import accounts via QR code URIs
+- **Smart Autocomplete**: Intelligent account name suggestions with fuzzy matching
+- **Secure by Design**: 
+  - Zero-knowledge architecture (no cloud sync)
+  - Secure password-based file encryption
+  - Secure deletion of old data
+  - Memory-safe operations with zeroization
+- **Privacy Features**: Option to hide OTP codes on screen while copying to clipboard
+- **Notes Support**: Add optional notes to your accounts
 
 ## Installation
 
 ### Prerequisites
 
-1. Rust
-2. Cargo (included with Rust)
+- Rust
+- Cargo package manager
 
 ### Arch Linux (AUR)
+
 You can install it using an AUR helper like ```yay```:
 ```bash
 yay -S kripton-authenticator
@@ -36,117 +52,121 @@ or
 yay -S kripton-authenticator-bin
 ```
 
-### Build from Source
+### From Source
 
-1. Clone the repository:
 ```bash
+# Clone the repository
 git clone https://github.com/clauderarch/kripton-authenticator.git
 cd kripton-authenticator
-```
 
-2. Build the application:
-```bash
+# Build and install
 cargo build --release
 ```
 
-3. Run the application:
-```bash
-./target/release/kripton-authenticator
-```
-
-### Dependencies
-The application uses the following Rust crates:
-
-```aes-gcm:``` For AES-256-GCM encryption.
-
-```argon2:``` For secure key derivation.
-
-```base32:``` For Base32 encoding/decoding.
-
-```chrono:``` For timestamp handling in TOTP.
-
-```hmac, sha1, sha2:``` For HMAC-based OTP generation.
-
-```serde:``` For JSON serialization/deserialization.
-
-```arboard:``` For clipboard integration.
-
-```rpassword:``` For secure password input.
-
-```zeroize:``` For securely zeroing sensitive data.
-
-```thiserror:``` For custom error handling.
-
-```url``` and ```urlencoding:``` For parsing and encoding otpauth:// URIs.
-
-Run ```cargo install``` to automatically fetch and install dependencies.
-
 ## Usage
 
-### Run the Application:
-```bash
-./target/release/kripton-authenticator
+### First Launch
+
+On first launch, you'll be prompted to set a master password:
+
+**Important**: If you forget your master password, there is no way to recover your data. Use the backup feature regularly!
+
+### Main Menu Options
+
+1. **Get Code** - Generate an OTP code for an account
+2. **Add Account** - Add a new 2FA account (manual or via URI)
+3. **List Accounts** - View all saved accounts
+4. **Edit Account** - Modify account settings
+5. **Delete Account** - Remove an account
+6. **View Note** - Display the note for an account
+7. **Backup Codes** - Export your accounts
+8. **Restore Codes** - Import accounts from backup
+9. **Settings** - Configure application preferences
+10. **Exit** - Close the application
+
+### Adding an Account
+
+#### Manual Entry
+```
+1. Select "Add account"
+2. Choose "Manual input"
+3. Enter account name (e.g., "GitHub:username")
+4. Enter Base32 secret key
+5. Configure OTP parameters (type, algorithm, digits, step/counter)
 ```
 
+#### Via otpauth:// URI
+```
+1. Select "Add account"
+2. Choose "otpauth URI"
+3. Paste the otpauth:// URL from your QR code
+4. Optionally modify the account name
+```
 
-### Set a Master Password:
+### Backup Formats
 
-On first run, you'll be prompted to set a master password. This password is used to encrypt and decrypt your stored accounts.
-Warning: If you forget your master password, your accounts cannot be recovered. Use the backup feature to store your data securely.
+Kripton Authenticator supports three backup formats:
 
+1. **Plain Text (.txt)**: Unencrypted, human-readable format
+2. **Encrypted Backup (.enc)**: Password-protected encrypted backup, this feature only supports .enc files created by Kripton Authenticator.
+3. **otpauth:// URI List (.txt)**: QR-code compatible format
 
-### Main Menu Options:
-**Get code:** Generate an OTP code for a specific account. Optionally copies to clipboard.
+## Technical Details
 
-**Add account:** Add a new TOTP or HOTP account with a custom name, secret, algorithm (SHA-1, SHA-256, SHA-512), and digits (6 or 8).
+### Encryption Specifications
 
-**Edit account:** Modify account name, secret, parameters, or notes.
+- **Symmetric Encryption**: AES-256-GCM
+- **Key Derivation**: Argon2id
+  - Memory: 128 MB
+  - Iterations: 3
+  - Parallelism: 4
+- **Nonce**: 12 bytes (randomly generated per encryption)
+- **Salt**: 16 bytes (unique per store file)
 
-**List accounts:** Display all saved accounts with their type, algorithm, and digits.
+### Security Features
 
-**Delete account:** Remove an account from the store.
+- **Password-Derived File Naming**: Store files are named based on a hash of your password
+- **Secure Memory Handling**: Sensitive data is zeroized after use
+- **Atomic File Operations**: Safe concurrent access protection
+- **Permission Hardening**: Store files are created with 0600 permissions (Unix)
 
-**View note:** Display the note associated with an account.
+### Supported OTP Parameters
 
-**Backup codes:** Export accounts in plain text, encrypted, or ```otpauth://``` URI format.
+- **Types**: TOTP, HOTP
+- **Algorithms**: SHA-1, SHA-256, SHA-512
+- **Digits**: 6 or 8
+- **Step (TOTP)**: Configurable (default: 30 seconds)
+- **Counter (HOTP)**: Auto-incrementing with user confirmation
 
-**Restore codes:** Import accounts from a backup file (plain text, encrypted, or URI format).
+## Data Storage
 
-**Settings:** Toggle auto-copy to clipboard, hide OTP codes, or change the master password.
+Data is stored locally in platform-specific directories:
 
-**Exit:** Close the application.
+- **Linux**: `~/.local/share/KriptonAuthenticator/`
 
+Each password creates a unique encrypted store file named: `auth_store_<hash>.enc`
 
-### Backup and Restore:
+## Security Best Practices
 
-**Plain Text Backup:** Exports accounts in a readable format (unencrypted, use with caution).
-**Encrypted Backup:** Exports accounts encrypted with a separate backup password.
-**URI Backup:** Exports accounts as ```otpauth://``` URIs for QR code generation.
-**Restore:** Imports accounts from any of the above formats, skipping duplicates.
-
-
-## Security Considerations
-
-**Master Password:** The master password is critical for accessing your accounts. Store it securely or use the backup feature.
-
-**Encrypted Storage:** All accounts are stored in an encrypted file (auth_store_<hash>.enc) in the user's data directory.
-
-**Secure Deletion:** When changing the master password or deleting files, the application overwrites old files with random data before deletion.
-
-**Clipboard:** Codes copied to the clipboard are not cleared automatically. Be cautious when using auto-copy on shared systems.
-
-**Backup Files:** Plain text and URI backups are unencrypted. Store them securely to prevent unauthorized access.
-
-## Directory Structure
-
-**Source Code:** src/main.rs contains the main application logic.
-
-**Data Storage:** Encrypted store files are saved in the platform-specific data directory (e.g., ~/.local/share/KriptonAuthenticator/ on Linux).
-
-**Temporary Files:** Temporary files (.tmp) are used during encryption and securely deleted after successful operations.
+1. **Use a Strong Master Password**: Your master password is the only key to your data
+2. **Regular Backups**: Keep encrypted backups in a secure location
+3. **Physical Security**: Ensure your device is physically secure
+4. **Unique Passwords**: Don't reuse your master password elsewhere
+5. **Secure Deletion**: The app uses secure deletion when removing old store files
 
 ## Contributing
-Contributions are welcome! If you have suggestions or want to report an issue, please open an issue or submit a pull request.
+
+Contributions are welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
 
 ## License
-This project is licensed under the **[GPL-3.0]** - see the LICENSE file for details.
+
+This project is licensed under the GPL-3.0 License
+
+## Disclaimer
+
+This software is provided "as is" without warranty of any kind. While every effort has been made to ensure security, users should:
+
+- Maintain secure backups of their data
+- Use at their own risk
+- Understand that forgotten passwords cannot be recovered
+- Review the code before trusting it with sensitive data
